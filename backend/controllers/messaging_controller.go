@@ -24,7 +24,8 @@ var wsUpgrader = websocket.Upgrader{
 	WriteBufferSize: 1024,
 	// Allow all origins for now; adjust for production.
 	CheckOrigin: func(r *http.Request) bool {
-		return true
+		return r.Header.Get("Origin") == "https://app.launay.one" ||
+			r.Header.Get("Origin") == "http://localhost"
 	},
 }
 

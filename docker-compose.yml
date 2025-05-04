@@ -1,17 +1,12 @@
-version: "3.8"
-
 services:
   redis:
     image: "${REDIS_IMAGE}:${REDIS_TAG}"
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.redis.rule=Host(`${APP_DOMAIN}`) && PathPrefix(`/redis`)"
-      - "traefik.http.routers.redis.entryPoints=web"
-      - "traefik.http.middlewares.strip-redis.stripPrefix.prefixes=/redis"
-      - "traefik.http.routers.redis.middlewares=strip-redis"
-      - "traefik.http.services.redis.loadBalancer.server.port=${REDIS_PORT}"
-    ports:
-      - "${REDIS_PORT}:${REDIS_PORT}"
+      - "traefik.tcp.routers.redis.entrypoints=websecure"
+      - "traefik.tcp.routers.redis.rule=HostSNI(`*`)"
+      - "traefik.tcp.routers.redis.tls=true"
+      - "traefik.tcp.services.redis.loadbalancer.server.port=6379"
     volumes:
       - redis:/data
     command:
@@ -20,18 +15,11 @@ services:
       - "yes"
       - --notify-keyspace-events
       - "Ex"
-    networks:
-      - web
+    networks: [internal]
+    expose: ["6379"]
 
   db:
     image: "${POSTGRES_IMAGE}:${POSTGRES_TAG}"
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.pg.rule=Host(`${APP_DOMAIN}`) && PathPrefix(`/pg`)"
-      - "traefik.http.routers.pg.entryPoints=web"
-      - "traefik.http.middlewares.strip-pg.stripPrefix.prefixes=/pg"
-      - "traefik.http.routers.pg.middlewares=strip-pg"
-      - "traefik.http.services.pg.loadBalancer.server.port=${DB_PORT}"
     environment:
       POSTGRES_DB: "${DB_NAME}"
       POSTGRES_USER: "${DB_USER}"
@@ -40,19 +28,12 @@ services:
       - "${DB_PORT}:${DB_PORT}"
     volumes:
       - pgdata:/var/lib/postgresql/data
-    networks:
-      - web
+    networks: [internal]
+    expose: ["5432"]
 
   seaweedfs:
     image: "${SEAWEED_IMAGE}:${SEAWEED_TAG}"
     container_name: seaweedfs
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.s3.rule=Host(`${APP_DOMAIN}`) && PathPrefix(`/storage`)"
-      - "traefik.http.routers.s3.entryPoints=web"
-      - "traefik.http.middlewares.strip-s3.stripPrefix.prefixes=/storage"
-      - "traefik.http.routers.s3.middlewares=strip-s3"
-      - "traefik.http.services.s3.loadBalancer.server.port=${SEAWEED_S3_PORT}"
     ports:
       - "${SEAWEED_MASTER_PORT}:${SEAWEED_MASTER_PORT}"
       - "${SEAWEED_FILER_PORT}:${SEAWEED_FILER_PORT}"
@@ -61,9 +42,9 @@ services:
       - server
       - "-ip=0.0.0.0"
       - "-master.port=${SEAWEED_MASTER_PORT}"
-      - "-filer" # <-- note the dash
+      - "-filer"
       - "-filer.port=${SEAWEED_FILER_PORT}"
-      - "-s3" # <-- and here
+      - "-s3"
       - "-s3.port=${SEAWEED_S3_PORT}"
     volumes:
       - seaweedfs:/data
@@ -75,23 +56,25 @@ services:
       context: "${APP_BUILD_CONTEXT}"
       dockerfile: "${APP_DOCKERFILE}"
     restart: always
+    image: go_launay
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.go.rule=Host(`${APP_DOMAIN}`) && PathPrefix(`/`)"
       - "traefik.http.routers.go.entryPoints=web"
       - "traefik.http.services.go.loadBalancer.server.port=${APP_PORT}"
     environment:
-      REDIS_ADDRESS: "${REDIS_ADDRESS}"
+      REDIS_ADDRESS: "redis:6379"
       REDIS_PASSWORD: "${REDIS_PASSWORD}"
       JWT_SECRET: "${JWT_SECRET}"
       APP_PORT: "${APP_PORT}"
-      SEAWEEDFS_URL: "${SEAWEEDFS_URL}"
+      SEAWEEDFS_URL: "http://seaweedfs:8333"
       DB_HOST: "${DB_HOST}"
       DB_USER: "${DB_USER}"
       DB_PASSWORD: "${DB_PASSWORD}"
       DB_NAME: "${DB_NAME}"
       DB_PORT: "${DB_PORT}"
       DB_TIMEZONE: "${DB_TIMEZONE}"
+      DB_SSLMODE: "disable"
     ports:
       - "${APP_PORT}:${APP_PORT}"
     depends_on:
@@ -100,24 +83,28 @@ services:
       - db
     networks:
       - web
+      - internal
 
   traefik:
     image: "${TRAEFIK_IMAGE}:${TRAEFIK_TAG}"
     command:
       - --entrypoints.web.address=:80
       - --entrypoints.websecure.address=:443
-      - --entrypoints.dashboard.address=:${TRAEFIK_DASHBOARD_PORT}
       - --providers.docker=true
       - --providers.docker.exposedbydefault=false
       - --certificatesresolvers.myresolver.acme.tlschallenge=true
       - --certificatesresolvers.myresolver.acme.email=${LE_EMAIL}
       - --certificatesresolvers.myresolver.acme.storage=/letsencrypt/acme.json
-      - --api.dashboard=true
-      - --api.insecure=true
+      - "--api.dashboard=true"
+      - "--api.insecure=false"
+      - traefik.http.routers.traefik.rule=Host(`traefik.launay.one`)
+      - traefik.http.routers.traefik.entrypoints=websecure
+      - traefik.http.routers.traefik.tls.certresolver=letsencrypt
+      - traefik.http.routers.traefik.middlewares=auth
+      - traefik.http.middlewares.auth.basicauth.users=admin:$$apr1$$<hash>
     ports:
       - "80:80"
       - "443:443"
-      - "${TRAEFIK_DASHBOARD_PORT}:${TRAEFIK_DASHBOARD_PORT}"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./letsencrypt:/letsencrypt
@@ -130,6 +117,8 @@ services:
       - redis
 
 networks:
+  internal:
+    internal: true
   web:
     external: true
 

@@ -7,7 +7,6 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
-	ginprometheus "github.com/zsais/go-gin-prometheus"
 )
 
 func SetupRouter(
@@ -23,10 +22,6 @@ func SetupRouter(
 	// Middlewares
 	router.Use(gin.Recovery())
 	router.Use(middlewares.Logger())
-
-	//Prometheus
-	p := ginprometheus.NewPrometheus("launay-dot-one")
-	p.Use(router)
 
 	// Health check route
 	router.GET("/health", func(c *gin.Context) {
