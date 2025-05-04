@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"os"
+	"strings"
 	"time"
 
 	connectionmanager "launay-dot-one/manager"
@@ -19,165 +19,151 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-var wsUpgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-	// Allow all origins for now; adjust for production.
-	CheckOrigin: func(r *http.Request) bool {
-		return r.Header.Get("Origin") == "https://app.launay.one" ||
-			r.Header.Get("Origin") == "http://localhost"
-	},
+// ----------------------------------------------------------------------------
+// helpers
+// ----------------------------------------------------------------------------
+
+func parseJWT(tokenStr string, secret []byte) (jwt.MapClaims, error) {
+	tok, err := jwt.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {
+		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+		}
+		return secret, nil
+	})
+	if err != nil || !tok.Valid {
+		return nil, fmt.Errorf("invalid token: %w", err)
+	}
+	claims, ok := tok.Claims.(jwt.MapClaims)
+	if !ok || claims["user_id"] == nil {
+		return nil, fmt.Errorf("missing user_id claim")
+	}
+	return claims, nil
 }
+
+func buildUpgrader() websocket.Upgrader {
+	raw := utils.GetEnv("WS_ALLOWED_ORIGINS", "https://app.launay.one")
+	allowed := strings.Split(raw, ",")
+
+	return websocket.Upgrader{
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+		CheckOrigin: func(r *http.Request) bool {
+			origin := r.Header.Get("Origin")
+			for _, a := range allowed {
+				if strings.TrimSpace(a) == origin {
+					return true
+				}
+			}
+			return false
+		},
+	}
+}
+
+// ----------------------------------------------------------------------------
+// controller
+// ----------------------------------------------------------------------------
 
 type MessagingController struct {
 	messagingService services.MessagingService
 	groupService     services.GroupService
 	logger           *logrus.Logger
+	secret           []byte
+	upgrader         websocket.Upgrader
 }
 
-func NewMessagingController(ms services.MessagingService, gs services.GroupService, logger *logrus.Logger) *MessagingController {
+func NewMessagingController(ms services.MessagingService, gs services.GroupService, l *logrus.Logger) *MessagingController {
+	sec := utils.MustEnv("JWT_SECRET")
 	return &MessagingController{
 		messagingService: ms,
 		groupService:     gs,
-		logger:           logger,
+		logger:           l,
+		secret:           []byte(sec),
+		upgrader:         buildUpgrader(),
 	}
 }
 
-// RegisterRoutes registers messaging endpoints with auth middleware.
 func (mc *MessagingController) RegisterRoutes(r *gin.Engine) {
-	messageRoutes := r.Group("/messages")
+	msg := r.Group("/messages")
 	{
-		messageRoutes.GET("/history", middlewares.AuthMiddleware(), mc.GetChatHistory)
-		messageRoutes.POST("/reaction", middlewares.AuthMiddleware(), mc.HandleAddReaction)
-		messageRoutes.GET("/ws", mc.HandleWebSocket)
-		messageRoutes.GET("/conversations", middlewares.AuthMiddleware(), mc.GetAllUserConversations)
-
+		msg.GET("/history", middlewares.AuthMiddleware(), mc.GetChatHistory)
+		msg.POST("/reaction", middlewares.AuthMiddleware(), mc.HandleAddReaction)
+		msg.GET("/ws", mc.HandleWebSocket) // auth inside
+		msg.GET("/conversations", middlewares.AuthMiddleware(), mc.GetAllUserConversations)
 	}
 }
 
-// HandleWebSocket upgrades the connection, stores it, processes incoming messages,
-// and delivers them to the appropriate recipient(s) in real time.
+// ----------------------------------------------------------------------------
+// WebSocket handler
+// ----------------------------------------------------------------------------
+
 func (mc *MessagingController) HandleWebSocket(c *gin.Context) {
-	// Extract the token from the query string.
-	tokenStr := c.Query("token")
-	if tokenStr == "" {
-		utils.RespondError(c, http.StatusUnauthorized, "Unauthorized", "Missing token in query parameters")
+	// 1. Extract token from the Authorization header like the usual middleware.
+	auth := c.GetHeader("Authorization")
+	parts := strings.Split(auth, " ")
+	if len(parts) != 2 || parts[0] != "Bearer" {
+		utils.RespondError(c, http.StatusUnauthorized, "Unauthorized", "Missing Bearer token")
 		return
 	}
-
-	// Retrieve the JWT secret from the environment.
-	secret := os.Getenv("JWT_SECRET")
-	if secret == "" {
-		utils.RespondError(c, http.StatusInternalServerError, "Server error", "JWT_SECRET not set on server")
-		return
-	}
-
-	// Validate the token using the same logic as the auth middleware.
-	token, err := jwt.Parse(tokenStr, func(token *jwt.Token) (interface{}, error) {
-		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
-		}
-		return []byte(secret), nil
-	})
-	if err != nil || !token.Valid {
-		utils.RespondError(c, http.StatusUnauthorized, "Unauthorized", "Invalid or expired token")
-		return
-	}
-
-	// Extract the user_id from the token claims.
-	claims, ok := token.Claims.(jwt.MapClaims)
-	if !ok || claims["user_id"] == nil {
-		utils.RespondError(c, http.StatusUnauthorized, "Unauthorized", "Missing user_id in token claims")
+	claims, err := parseJWT(parts[1], mc.secret)
+	if err != nil {
+		utils.RespondError(c, http.StatusUnauthorized, "Unauthorized", err.Error())
 		return
 	}
 	senderID := claims["user_id"].(string)
 
-	// Upgrade the connection to a websocket.
-	conn, err := wsUpgrader.Upgrade(c.Writer, c.Request, nil)
+	// 2. Upgrade the connection.
+	conn, err := mc.upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
 		mc.logger.Error("WebSocket upgrade error: ", err)
 		return
 	}
-	// Add the connection to the connection manager.
 	connectionmanager.ConnManager.Add(senderID, conn)
 	defer connectionmanager.ConnManager.Remove(senderID)
 
+	// 3. Handle messages.
 	ctx := c.Request.Context()
 	for {
-		_, msgData, err := conn.ReadMessage()
+		_, data, err := conn.ReadMessage()
 		if err != nil {
 			mc.logger.Warn("WebSocket read error: ", err)
 			break
 		}
-
 		var msg models.Message
-		if err := json.Unmarshal(msgData, &msg); err != nil {
-			mc.logger.Warn("Invalid message format: ", err)
+		if err := json.Unmarshal(data, &msg); err != nil {
+			mc.logger.Warn("Invalid message JSON: ", err)
 			continue
 		}
-		// Ensure the sender's identity is correct and set the timestamp.
 		msg.SenderID = senderID
 		msg.Timestamp = time.Now()
 
-		// Save the message temporarily in Redis.
 		if err := mc.messagingService.SendMessage(ctx, msg); err != nil {
-			mc.logger.Error("Failed to send message: ", err)
 			_ = conn.WriteJSON(utils.APIResponse{
-				Code:    http.StatusInternalServerError,
-				Message: "Failed to send message",
-				Error:   err.Error(),
+				Code: http.StatusInternalServerError, Message: "Failed to send message", Error: err.Error(),
 			})
 			continue
 		}
 
-		// Real-time delivery logic.
 		switch msg.TargetType {
 		case "user":
-			// Direct message: deliver to recipient if connected.
-			if recipientConn, ok := connectionmanager.ConnManager.Get(msg.TargetID); ok {
-				if err := recipientConn.WriteJSON(utils.APIResponse{
-					Code:    http.StatusOK,
-					Message: "New message received",
-					Data:    msg,
-				}); err != nil {
-					mc.logger.Error("Failed to deliver message to recipient: ", err)
-				}
-			} else {
-				mc.logger.Infof("Recipient %s not connected", msg.TargetID)
+			if rc, ok := connectionmanager.ConnManager.Get(msg.TargetID); ok {
+				_ = rc.WriteJSON(utils.APIResponse{Code: http.StatusOK, Message: "New message", Data: msg})
 			}
-
 		case "group", "channel":
-			// For groups/channels: fetch group members via groupService.
 			members, err := mc.groupService.ListMembers(ctx, msg.TargetID)
 			if err != nil {
-				mc.logger.Error("Failed to list group members: ", err)
-			} else {
-				for _, membership := range members {
-					// Skip the sender.
-					if membership.UserID == senderID {
-						continue
-					}
-					if recipientConn, ok := connectionmanager.ConnManager.Get(membership.UserID); ok {
-						if err := recipientConn.WriteJSON(utils.APIResponse{
-							Code:    http.StatusOK,
-							Message: "New message received",
-							Data:    msg,
-						}); err != nil {
-							mc.logger.Errorf("Failed to deliver message to member %s: %v", membership.UserID, err)
-						}
-					}
+				mc.logger.Error("list members: ", err)
+			}
+			for _, m := range members {
+				if m.UserID == senderID {
+					continue
+				}
+				if rc, ok := connectionmanager.ConnManager.Get(m.UserID); ok {
+					_ = rc.WriteJSON(utils.APIResponse{Code: http.StatusOK, Message: "New message", Data: msg})
 				}
 			}
 		}
 
-		// Echo confirmation back to the sender.
-		if err := conn.WriteJSON(utils.APIResponse{
-			Code:    http.StatusOK,
-			Message: "Message sent",
-			Data:    msg,
-		}); err != nil {
-			mc.logger.Error("Failed to send confirmation to sender: ", err)
-		}
+		_ = conn.WriteJSON(utils.APIResponse{Code: http.StatusOK, Message: "Message sent", Data: msg})
 	}
 }
 

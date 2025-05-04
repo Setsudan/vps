@@ -15,7 +15,6 @@ func SetupRouter(
 	userController *controllers.UserController,
 	messagingController *controllers.MessagingController,
 	groupController *controllers.GroupController,
-	locationController *controllers.LocationController,
 ) *gin.Engine {
 	router := gin.New()
 
@@ -38,7 +37,6 @@ func SetupRouter(
 	userController.RegisterRoutes(router)
 	groupController.RegisterRoutes(router)
 
-	locationController.RegisterRoutes(router)
 	messagingController.RegisterRoutes(router)
 
 	// Other websocket routes.

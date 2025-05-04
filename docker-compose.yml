@@ -1,22 +1,29 @@
 services:
+  # -------------------------------------------------
+  # DATA LAYER — internal‑only, not exposed via Traefik
+  # -------------------------------------------------
   redis:
     image: "${REDIS_IMAGE}:${REDIS_TAG}"
-    labels:
-      - "traefik.enable=true"
-      - "traefik.tcp.routers.redis.entrypoints=websecure"
-      - "traefik.tcp.routers.redis.rule=HostSNI(`*`)"
-      - "traefik.tcp.routers.redis.tls=true"
-      - "traefik.tcp.services.redis.loadbalancer.server.port=6379"
-    volumes:
-      - redis:/data
     command:
       - redis-server
       - --appendonly
       - "yes"
       - --notify-keyspace-events
       - "Ex"
+    volumes:
+      - redis:/data
     networks: [internal]
     expose: ["6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "PING"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M
 
   db:
     image: "${POSTGRES_IMAGE}:${POSTGRES_TAG}"
@@ -24,20 +31,23 @@ services:
       POSTGRES_DB: "${DB_NAME}"
       POSTGRES_USER: "${DB_USER}"
       POSTGRES_PASSWORD: "${DB_PASSWORD}"
-    ports:
-      - "${DB_PORT}:${DB_PORT}"
     volumes:
       - pgdata:/var/lib/postgresql/data
     networks: [internal]
-    expose: ["5432"]
+    expose: ["5432"] # no host‑port published
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
 
   seaweedfs:
     image: "${SEAWEED_IMAGE}:${SEAWEED_TAG}"
-    container_name: seaweedfs
-    ports:
-      - "${SEAWEED_MASTER_PORT}:${SEAWEED_MASTER_PORT}"
-      - "${SEAWEED_FILER_PORT}:${SEAWEED_FILER_PORT}"
-      - "${SEAWEED_S3_PORT}:${SEAWEED_S3_PORT}"
     command:
       - server
       - "-ip=0.0.0.0"
@@ -48,43 +58,68 @@ services:
       - "-s3.port=${SEAWEED_S3_PORT}"
     volumes:
       - seaweedfs:/data
-    networks:
-      - web
+    networks: [internal]
+    expose: ["${SEAWEED_S3_PORT}"] # internal only
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "${SEAWEED_S3_PORT}"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
 
+  # -------------------------------------------------
+  # APPLICATION API
+  # -------------------------------------------------
   go_launay:
     build:
       context: "${APP_BUILD_CONTEXT}"
       dockerfile: "${APP_DOCKERFILE}"
-    restart: always
     image: go_launay
+    restart: always
     labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.go.rule=Host(`${APP_DOMAIN}`) && PathPrefix(`/`)"
-      - "traefik.http.routers.go.entryPoints=web"
-      - "traefik.http.services.go.loadBalancer.server.port=${APP_PORT}"
+      - traefik.enable=true
+      - traefik.http.routers.go.rule=Host(`${APP_DOMAIN}`, `localhost`) && PathPrefix(`/`)
+      - traefik.http.routers.go.entrypoints=web
+      - traefik.http.services.go.loadBalancer.server.port=8080
     environment:
       REDIS_ADDRESS: "redis:6379"
       REDIS_PASSWORD: "${REDIS_PASSWORD}"
       JWT_SECRET: "${JWT_SECRET}"
       APP_PORT: "${APP_PORT}"
-      SEAWEEDFS_URL: "http://seaweedfs:8333"
-      DB_HOST: "${DB_HOST}"
+      SEAWEEDFS_URL: "http://seaweedfs:${SEAWEED_S3_PORT}"
+      DB_HOST: "db"
       DB_USER: "${DB_USER}"
       DB_PASSWORD: "${DB_PASSWORD}"
       DB_NAME: "${DB_NAME}"
-      DB_PORT: "${DB_PORT}"
-      DB_TIMEZONE: "${DB_TIMEZONE}"
+      DB_PORT: "5432"
       DB_SSLMODE: "disable"
+      DB_TIMEZONE: "${DB_TIMEZONE}"
+      WS_ALLOWED_ORIGINS: "*" # TODO: set to frontend URL
     ports:
       - "${APP_PORT}:${APP_PORT}"
-    depends_on:
-      - redis
-      - seaweedfs
-      - db
     networks:
       - web
       - internal
+    depends_on:
+      redis:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
 
+  # -------------------------------------------------
+  # EDGE ROUTER
+  # -------------------------------------------------
   traefik:
     image: "${TRAEFIK_IMAGE}:${TRAEFIK_TAG}"
     command:
@@ -95,11 +130,11 @@ services:
       - --certificatesresolvers.myresolver.acme.tlschallenge=true
       - --certificatesresolvers.myresolver.acme.email=${LE_EMAIL}
       - --certificatesresolvers.myresolver.acme.storage=/letsencrypt/acme.json
-      - "--api.dashboard=true"
-      - "--api.insecure=false"
+      - --api.dashboard=true
+      - --api.insecure=false
       - traefik.http.routers.traefik.rule=Host(`traefik.launay.one`)
       - traefik.http.routers.traefik.entrypoints=websecure
-      - traefik.http.routers.traefik.tls.certresolver=letsencrypt
+      - traefik.http.routers.traefik.tls.certresolver=myresolver
       - traefik.http.routers.traefik.middlewares=auth
       - traefik.http.middlewares.auth.basicauth.users=admin:$$apr1$$<hash>
     ports:
@@ -108,14 +143,18 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./letsencrypt:/letsencrypt
-    networks:
-      - web
+    networks: [web]
     depends_on:
       - go_launay
-      - seaweedfs
-      - db
-      - redis
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M
 
+# -------------------------------------------------
+# NETWORKS / VOLUMES
+# -------------------------------------------------
 networks:
   internal:
     internal: true

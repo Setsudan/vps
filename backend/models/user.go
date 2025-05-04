@@ -16,8 +16,6 @@ type User struct {
 	UpdatedAt time.Time  `json:"updatedAt"`
 	DeletedAt *time.Time `json:"deletedAt,omitempty"`
 	Bio       string     `json:"bio"`
-	Latitude  float64    `json:"latitude" gorm:"type:decimal(9,6)"`
-	Longitude float64    `json:"longitude" gorm:"type:decimal(9,6)"`
 }
 
 // PublicUser represents a safe version of the User record.
@@ -40,8 +38,6 @@ func (u *User) ToPublic() PublicUser {
 	return PublicUser{
 		ID:        u.ID,
 		Username:  u.Username,
-		Latitude:  u.Latitude,
-		Longitude: u.Longitude,
 		Bio:       u.Bio,
 		Email:     u.Email,
 		Role:      u.Role,

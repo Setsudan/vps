@@ -68,7 +68,6 @@ func InitServer() (*http.Server, error) {
 	userService := services.NewUserService(storageService, db)
 	groupService := services.NewGroupService(groupRepo)
 	messagingService := services.NewMessagingService(rdb, messagingRepo)
-	locationService := services.NewLocationService(rdb)
 
 	// Initialize controllers.
 	presenceController := controllers.NewPresenceController(presenceService, rdb, logger)
@@ -76,7 +75,6 @@ func InitServer() (*http.Server, error) {
 	userController := controllers.NewUserController(logger, userService, string(jwtSecret))
 	messagingController := controllers.NewMessagingController(messagingService, groupService, logger)
 	groupController := controllers.NewGroupController(groupService, logger)
-	locationController := controllers.NewLocationController(locationService, logger)
 
 	if err := listeners.RedisExpiredListener(context.Background(), rdb, messagingService); err != nil {
 		log.Printf("Error starting Redis expired listener: %v", err)
@@ -89,7 +87,6 @@ func InitServer() (*http.Server, error) {
 		userController,
 		messagingController,
 		groupController,
-		locationController,
 	)
 
 	// Configure CORS.
