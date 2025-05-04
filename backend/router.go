@@ -7,7 +7,6 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
-	ginprometheus "github.com/zsais/go-gin-prometheus"
 )
 
 func SetupRouter(
@@ -16,17 +15,12 @@ func SetupRouter(
 	userController *controllers.UserController,
 	messagingController *controllers.MessagingController,
 	groupController *controllers.GroupController,
-	locationController *controllers.LocationController,
 ) *gin.Engine {
 	router := gin.New()
 
 	// Middlewares
 	router.Use(gin.Recovery())
 	router.Use(middlewares.Logger())
-
-	//Prometheus
-	p := ginprometheus.NewPrometheus("launay-dot-one")
-	p.Use(router)
 
 	// Health check route
 	router.GET("/health", func(c *gin.Context) {
@@ -43,7 +37,6 @@ func SetupRouter(
 	userController.RegisterRoutes(router)
 	groupController.RegisterRoutes(router)
 
-	locationController.RegisterRoutes(router)
 	messagingController.RegisterRoutes(router)
 
 	// Other websocket routes.

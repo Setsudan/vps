@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
-	"strings"
 	"time"
 
 	"launay-dot-one/controllers"
@@ -34,7 +34,7 @@ func InitServer() (*http.Server, error) {
 		log.Println(err)
 	}
 
-	jwtSecret := getEnv("JWT_SECRET", "")
+	var jwtSecret = []byte(utils.MustEnv("JWT_SECRET"))
 	logger := utils.GetLogger()
 
 	rdb, err := initRedis(logger)
@@ -64,19 +64,17 @@ func InitServer() (*http.Server, error) {
 
 	// Initialize services.
 	presenceService := realtime.NewPresenceService(rdb)
-	authService := services.NewAuthService(db, jwtSecret)
+	authService := services.NewAuthService(db, string(jwtSecret))
 	userService := services.NewUserService(storageService, db)
 	groupService := services.NewGroupService(groupRepo)
 	messagingService := services.NewMessagingService(rdb, messagingRepo)
-	locationService := services.NewLocationService(rdb)
 
 	// Initialize controllers.
 	presenceController := controllers.NewPresenceController(presenceService, rdb, logger)
 	authController := controllers.NewAuthController(authService, logger)
-	userController := controllers.NewUserController(logger, userService, jwtSecret)
+	userController := controllers.NewUserController(logger, userService, string(jwtSecret))
 	messagingController := controllers.NewMessagingController(messagingService, groupService, logger)
 	groupController := controllers.NewGroupController(groupService, logger)
-	locationController := controllers.NewLocationController(locationService, logger)
 
 	if err := listeners.RedisExpiredListener(context.Background(), rdb, messagingService); err != nil {
 		log.Printf("Error starting Redis expired listener: %v", err)
@@ -89,7 +87,6 @@ func InitServer() (*http.Server, error) {
 		userController,
 		messagingController,
 		groupController,
-		locationController,
 	)
 
 	// Configure CORS.
@@ -148,31 +145,40 @@ func initRedis(logger *logrus.Logger) (*redis.Client, error) {
 }
 
 func initS3Client() (*minio.Client, error) {
-	endpoint := strings.TrimPrefix(strings.TrimPrefix(getEnv("SEAWEEDFS_URL", "http://localhost:8333"), "http://"), "https://")
+	rawURL := getEnv("SEAWEEDFS_URL", "http://localhost:8333")
+
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid SEAWEEDFS_URL %q: %w", rawURL, err)
+	}
+
+	endpoint := u.Host            // host[:port]
+	secure := u.Scheme == "https" // true ↔ HTTPS
+
 	accessKey := os.Getenv("S3_ACCESS_KEY")
 	secretKey := os.Getenv("S3_SECRET_KEY")
 
-	var client *minio.Client
-	var err error
-	maxRetries := 5
-	for i := 0; i < maxRetries; i++ {
-		client, err = minio.New(endpoint, &minio.Options{
+	const maxRetries = 5
+	var lastErr error
+
+	for i := 1; i <= maxRetries; i++ {
+		clt, err := minio.New(endpoint, &minio.Options{
 			Creds:  credentials.NewStaticV4(accessKey, secretKey, ""),
-			Secure: false,
+			Secure: secure,
 		})
 		if err == nil {
-			// Test connection
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			_, err = client.ListBuckets(ctx)
-			if err == nil {
-				return client, nil
+			if _, err = clt.ListBuckets(ctx); err == nil {
+				return clt, nil // success
 			}
 		}
-		log.Printf("Warning: failed to initialize S3 client (attempt %d/%d): %v. Retrying...", i+1, maxRetries, err)
-		time.Sleep(time.Duration(2<<i) * time.Second) // Exponential backoff
+
+		lastErr = err
+		log.Printf("Warning: S3 init failed (%d/%d): %v", i, maxRetries, err)
+		time.Sleep(time.Duration(1<<i) * time.Second) // 2 s, 4 s, 8 s…
 	}
-	return nil, fmt.Errorf("failed to initialize S3 client after %d attempts: %w", maxRetries, err)
+	return nil, fmt.Errorf("failed to initialise S3 client: %w", lastErr)
 }
 
 func initStorageService(client *minio.Client) (*storage.StorageService, error) {
@@ -208,23 +214,23 @@ func initStorageService(client *minio.Client) (*storage.StorageService, error) {
 }
 
 func initDatabaseWithDefaults() (*gorm.DB, error) {
+	host := utils.MustEnv("DB_HOST")
+	user := utils.MustEnv("DB_USER")
+	pass := utils.MustEnv("DB_PASSWORD")
+	dbName := utils.MustEnv("DB_NAME")
+	sslmode := utils.GetEnv("DB_SSLMODE", "disable") // override later if you add TLS
+	tz := utils.GetEnv("DB_TIMEZONE", "UTC")
+
 	dsn := fmt.Sprintf(
-		"host=%s user=%s password=%s dbname=%s port=%s sslmode=disable TimeZone=%s",
-		getEnv("DB_HOST", "localhost"),
-		getEnv("DB_USER", "tussler"),
-		getEnv("DB_PASSWORD", "tussle_password"),
-		getEnv("DB_NAME", "tussle_db"),
-		getEnv("DB_PORT", "5432"),
-		getEnv("DB_TIMEZONE", "Europe/Paris"),
+		"host=%s user=%s password=%s dbname=%s sslmode=%s TimeZone=%s",
+		host, user, pass, dbName, sslmode, tz,
 	)
+
 	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to database: %w", err)
 	}
 
-	// Auto-migrate models (including new Group, GroupMembership, and Message models).
-	// Note: The Group and Message models have been updated to use datatypes.JSON for fields
-	// like Tags, Attachments, and Reactions.
 	if err := db.AutoMigrate(
 		&models.User{},
 		&models.Group{},
