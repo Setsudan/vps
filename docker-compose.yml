@@ -85,6 +85,7 @@ services:
       - traefik.http.routers.go.rule=Host(`${APP_DOMAIN}`, `localhost`) && PathPrefix(`/`)
       - traefik.http.routers.go.entrypoints=web
       - traefik.http.services.go.loadBalancer.server.port=8080
+      - traefik.docker.network=web
     environment:
       REDIS_ADDRESS: "redis:6379"
       REDIS_PASSWORD: "${REDIS_PASSWORD}"
@@ -101,6 +102,8 @@ services:
       WS_ALLOWED_ORIGINS: "*" # TODO: set to frontend URL
     ports:
       - "${APP_PORT}:${APP_PORT}"
+    expose:
+      - "${APP_PORT}"
     networks:
       - web
       - internal
