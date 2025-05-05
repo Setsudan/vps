@@ -4,7 +4,7 @@ import (
 	"net/http"
 
 	"launay-dot-one/models"
-	"launay-dot-one/services"
+	authsvc "launay-dot-one/services/auth"
 	"launay-dot-one/utils"
 
 	"github.com/gin-gonic/gin"
@@ -12,13 +12,13 @@ import (
 )
 
 type AuthController struct {
-	authService services.AuthService
+	authService authsvc.Service
 	logger      *logrus.Logger
 }
 
-func NewAuthController(authService services.AuthService, logger *logrus.Logger) *AuthController {
+func NewAuthController(svc authsvc.Service, logger *logrus.Logger) *AuthController {
 	return &AuthController{
-		authService: authService,
+		authService: svc,
 		logger:      logger,
 	}
 }
@@ -49,17 +49,17 @@ func (ac *AuthController) Register(c *gin.Context) {
 }
 
 func (ac *AuthController) Login(c *gin.Context) {
-	var credentials struct {
+	var creds struct {
 		Email    string `json:"email"`
 		Password string `json:"password"`
 	}
-	if err := c.ShouldBindJSON(&credentials); err != nil {
+	if err := c.ShouldBindJSON(&creds); err != nil {
 		ac.logger.Warn("Invalid login payload: ", err)
 		utils.RespondError(c, http.StatusBadRequest, "Invalid request payload", err.Error())
 		return
 	}
 
-	token, err := ac.authService.LoginUser(c.Request.Context(), credentials.Email, credentials.Password)
+	token, err := ac.authService.LoginUser(c.Request.Context(), creds.Email, creds.Password)
 	if err != nil {
 		ac.logger.Warn("Login failed: ", err)
 		utils.RespondError(c, http.StatusUnauthorized, "Invalid credentials", err.Error())

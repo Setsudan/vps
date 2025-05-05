@@ -12,9 +12,21 @@ import (
 	"launay-dot-one/controllers"
 	"launay-dot-one/listeners"
 	"launay-dot-one/models"
+	"launay-dot-one/models/friendships"
+	"launay-dot-one/models/groups"
+	"launay-dot-one/models/guilds"
+	"launay-dot-one/models/resume"
 	"launay-dot-one/realtime"
 	"launay-dot-one/repositories"
-	"launay-dot-one/services"
+
+	authsvc "launay-dot-one/services/auth"
+	frdsvc "launay-dot-one/services/friendships"
+	groupsvc "launay-dot-one/services/groups" // legacy groups
+	guildsvc "launay-dot-one/services/guilds" // new guilds
+	msgsrv "launay-dot-one/services/messaging"
+	resumeSvc "launay-dot-one/services/resumes"
+	usersvc "launay-dot-one/services/users"
+
 	"launay-dot-one/storage"
 	"launay-dot-one/utils"
 
@@ -28,94 +40,102 @@ import (
 	"gorm.io/gorm"
 )
 
-// InitServer initializes dependencies and returns an HTTP server.
 func InitServer() (*http.Server, error) {
-	if err := loadEnv(); err != nil {
-		log.Println(err)
-	}
-
-	var jwtSecret = []byte(utils.MustEnv("JWT_SECRET"))
+	_ = godotenv.Load() // ignore missing .env
+	jwtSecret := utils.MustEnv("JWT_SECRET")
 	logger := utils.GetLogger()
 
+	// ─── Redis
 	rdb, err := initRedis(logger)
 	if err != nil {
 		return nil, err
 	}
 
+	// ─── Storage
 	s3Client, err := initS3Client()
 	if err != nil {
 		return nil, err
 	}
-
-	storageService, err := initStorageService(s3Client)
+	storageSvc, err := initStorageService(s3Client)
 	if err != nil {
 		return nil, err
 	}
 
+	// ─── Database & Migrations
 	db, err := initDatabaseWithDefaults()
 	if err != nil {
-		logger.Fatal("Database initialization with defaults failed: ", err)
+		logger.Fatal("Database init failed: ", err)
 		return nil, err
 	}
 
-	// Initialize repositories.
-	groupRepo := repositories.NewGroupRepository(db)
+	// ─── Repositories
+	userRepo := repositories.NewUserRepository(db)
+	groupRepo := repositories.NewGroupRepository(db) // legacy groups
 	messagingRepo := repositories.NewMessagingRepository(db)
+	friendRepo := repositories.NewFriendRequestRepository(db)
+	resumeRepo := repositories.NewResumeRepository(db)
+	guildRepo := repositories.NewGuildRepository(db)
+	guildMemberRepo := repositories.NewGuildMemberRepository(db)
 
-	// Initialize services.
+	// ─── Services
+	authService := authsvc.NewService(userRepo, jwtSecret, 72*time.Hour)
+	userService := usersvc.NewService(storageSvc, userRepo)
+	groupService := groupsvc.NewService(groupRepo)
+	friendService := frdsvc.NewService(friendRepo, db)
+	messagingService := msgsrv.NewService(rdb, messagingRepo)
+	resumeService := resumeSvc.NewService(resumeRepo)
+	guildService := guildsvc.NewService(guildRepo, guildMemberRepo)
 	presenceService := realtime.NewPresenceService(rdb)
-	authService := services.NewAuthService(db, string(jwtSecret))
-	userService := services.NewUserService(storageService, db)
-	groupService := services.NewGroupService(groupRepo)
-	messagingService := services.NewMessagingService(rdb, messagingRepo)
 
-	// Initialize controllers.
-	presenceController := controllers.NewPresenceController(presenceService, rdb, logger)
+	// ─── Controllers
 	authController := controllers.NewAuthController(authService, logger)
-	userController := controllers.NewUserController(logger, userService, string(jwtSecret))
-	messagingController := controllers.NewMessagingController(messagingService, groupService, logger)
+	userController := controllers.NewUserController(logger, userService)
 	groupController := controllers.NewGroupController(groupService, logger)
+	messagingController := controllers.NewMessagingController(messagingService, groupService, logger)
+	presenceController := controllers.NewPresenceController(presenceService, rdb, logger)
+	resumeController := controllers.NewResumeController(resumeService, logger)
+	friendshipController := controllers.NewFriendshipController(friendService, logger)
+	guildController := controllers.NewGuildController(guildService, logger)
 
+	// ─── Redis‐TTL cleanup & expired listener
+	go func() {
+		ticker := time.NewTicker(1 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			if err := messagingService.TransferExpiredMessages(context.Background()); err != nil {
+				logger.Error("TransferExpiredMessages error:", err)
+			}
+		}
+	}()
 	if err := listeners.RedisExpiredListener(context.Background(), rdb, messagingService); err != nil {
-		log.Printf("Error starting Redis expired listener: %v", err)
+		logger.Errorf("RedisExpiredListener error: %v", err)
 	}
 
-	// Setup Router.
+	// ─── Router & CORS
 	router := SetupRouter(
 		authController,
 		presenceController,
 		userController,
 		messagingController,
 		groupController,
+		resumeController,
+		friendshipController,
+		guildController,
 	)
-
-	// Configure CORS.
-	corsRouter := handlers.CORS(
-		handlers.AllowedOrigins([]string{"http://localhost:1420"}),
+	cors := handlers.CORS(
+		handlers.AllowedOrigins([]string{utils.GetEnv("CORS_ORIGIN", "http://localhost:1420")}),
 		handlers.AllowedMethods([]string{"GET", "POST", "PUT", "DELETE", "OPTIONS"}),
 		handlers.AllowedHeaders([]string{"Authorization", "Content-Type"}),
 	)(router)
 
-	server := &http.Server{
-		Handler:      corsRouter,
-		Addr:         ":" + getEnv("APP_PORT", "8080"),
-		WriteTimeout: 15 * time.Second,
+	srv := &http.Server{
+		Addr:         ":" + utils.GetEnv("APP_PORT", "8080"),
+		Handler:      cors,
 		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
 	}
-
-	logger.Info("Server initialization completed")
-	go func() {
-		ticker := time.NewTicker(1 * time.Minute)
-		defer ticker.Stop()
-		for range ticker.C {
-			err := messagingService.TransferExpiredMessages(context.Background())
-			if err != nil {
-				logger.Error("Error transferring expired messages: ", err)
-			}
-		}
-	}()
-	logger.Info("Initialized go routine for transferring expired messages")
-	return server, nil
+	logger.Info("Server initialized on port ", utils.GetEnv("APP_PORT", "8080"))
+	return srv, nil
 }
 
 func loadEnv() error {
@@ -218,31 +238,56 @@ func initDatabaseWithDefaults() (*gorm.DB, error) {
 	user := utils.MustEnv("DB_USER")
 	pass := utils.MustEnv("DB_PASSWORD")
 	dbName := utils.MustEnv("DB_NAME")
-	sslmode := utils.GetEnv("DB_SSLMODE", "disable") // override later if you add TLS
+	sslmode := utils.GetEnv("DB_SSLMODE", "disable")
 	tz := utils.GetEnv("DB_TIMEZONE", "UTC")
 
 	dsn := fmt.Sprintf(
 		"host=%s user=%s password=%s dbname=%s sslmode=%s TimeZone=%s",
 		host, user, pass, dbName, sslmode, tz,
 	)
-
 	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to database: %w", err)
 	}
 
+	if err := db.Exec(`CREATE EXTENSION IF NOT EXISTS "uuid-ossp";`).Error; err != nil {
+		return nil, fmt.Errorf("failed to create uuid-ossp extension: %w", err)
+	}
+
 	if err := db.AutoMigrate(
+		// core
 		&models.User{},
-		&models.Group{},
-		&models.GroupMembership{},
 		&models.Message{},
+
+		// legacy group feature
+		&groups.Group{},
+		&groups.GroupMembership{},
+
+		// friendship system
+		&friendships.FriendRequest{},
+
+		// Discord‐style guilds
+		&guilds.Guild{},
+		&guilds.GuildRole{},
+		&guilds.GuildMember{},
+		&guilds.Category{},
+		&guilds.Channel{},
+		&guilds.PermissionOverwrite{},
+
+		// resumes
+		&models.Resume{},
+		&resume.Education{},
+		&resume.Experience{},
+		&resume.Project{},
+		&resume.Certification{},
+		&resume.Skill{},
+		&resume.Interest{},
 	); err != nil {
 		return nil, fmt.Errorf("auto-migration failed: %w", err)
 	}
 
 	return db, nil
 }
-
 func getEnv(key, fallback string) string {
 	if value := os.Getenv(key); value != "" {
 		return value

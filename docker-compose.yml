@@ -131,12 +131,7 @@ services:
       - --certificatesresolvers.myresolver.acme.email=${LE_EMAIL}
       - --certificatesresolvers.myresolver.acme.storage=/letsencrypt/acme.json
       - --api.dashboard=true
-      - --api.insecure=false
-      - traefik.http.routers.traefik.rule=Host(`traefik.launay.one`)
-      - traefik.http.routers.traefik.entrypoints=websecure
-      - traefik.http.routers.traefik.tls.certresolver=myresolver
-      - traefik.http.routers.traefik.middlewares=auth
-      - traefik.http.middlewares.auth.basicauth.users=admin:$$apr1$$<hash>
+      - --api.insecure=true # TODO: set to false in production
     ports:
       - "80:80"
       - "443:443"

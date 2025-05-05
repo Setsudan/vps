@@ -1,8 +1,8 @@
-package models
+package groups
 
 import "time"
 
-// GroupMembership represents a user’s membership in a group with an associated role.
+// GroupMembership represents a user's membership in a group with an associated role.
 type GroupMembership struct {
 	GroupID   string    `json:"group_id" gorm:"primaryKey"`
 	UserID    string    `json:"user_id" gorm:"primaryKey"`

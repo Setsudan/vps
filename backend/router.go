@@ -1,10 +1,11 @@
 package main
 
 import (
+	"net/http"
+
 	"launay-dot-one/controllers"
 	"launay-dot-one/middlewares"
 	"launay-dot-one/utils"
-	"net/http"
 
 	"github.com/gin-gonic/gin"
 )
@@ -15,42 +16,42 @@ func SetupRouter(
 	userController *controllers.UserController,
 	messagingController *controllers.MessagingController,
 	groupController *controllers.GroupController,
+	resumeController *controllers.ResumeController,
+	friendshipController *controllers.FriendshipController,
+	guildController *controllers.GuildController,
 ) *gin.Engine {
 	router := gin.New()
+	router.Use(gin.Recovery(), middlewares.Logger())
 
-	// Middlewares
-	router.Use(gin.Recovery())
-	router.Use(middlewares.Logger())
-
-	// Health check route
+	// Health & Liveness
 	router.GET("/health", func(c *gin.Context) {
 		utils.RespondSuccess(c, http.StatusOK, "Healthy", nil)
 	})
-
-	// Liveness check route
 	router.GET("/liveness", func(c *gin.Context) {
 		utils.RespondSuccess(c, http.StatusOK, "Alive", nil)
 	})
 
-	// Routes registration.
+	// Core routes
 	authController.RegisterRoutes(router)
 	userController.RegisterRoutes(router)
 	groupController.RegisterRoutes(router)
-
 	messagingController.RegisterRoutes(router)
+	resumeController.RegisterRoutes(router)
+	friendshipController.RegisterRoutes(router)
+	guildController.RegisterRoutes(router)
 
-	// Other websocket routes.
+	// Presence WS & helper
 	router.GET("/presence", gin.WrapF(presenceController.GetAllPresence))
 	router.GET("/ws/presence", gin.WrapF(presenceController.HandleWebSocket))
 
-	// Route path
+	// Catch‐all
 	router.NoRoute(func(c *gin.Context) {
 		utils.RespondError(c, http.StatusNotFound, "Not Found", "The requested resource was not found")
 	})
 
+	// Root info
 	router.GET("/", func(c *gin.Context) {
 		utils.RespondSuccess(c, http.StatusOK, "launay-dot-one/Ogma's Golang API", nil)
 	})
-
 	return router
 }
