@@ -190,15 +190,23 @@ func initMinioClient() (*minio.Client, error) {
 		return nil, fmt.Errorf("invalid STORAGE_ENDPOINT %q: %w", rawURL, err)
 	}
 
-	client, err := minio.New(u.Host, &minio.Options{
-		Creds: credentials.NewStaticV4(
-			os.Getenv("MINIO_ROOT_USER"),
-			os.Getenv("MINIO_ROOT_PASSWORD"),
-			""),
-		Secure: u.Scheme == "https",
-	})
+	var client *minio.Client
+	retries := 3
+	for i := 0; i < retries; i++ {
+		client, err = minio.New(u.Host, &minio.Options{
+			Creds: credentials.NewStaticV4(
+				os.Getenv("MINIO_ROOT_USER"),
+				os.Getenv("MINIO_ROOT_PASSWORD"),
+				""),
+			Secure: u.Scheme == "https",
+		})
+		if err == nil {
+			break
+		}
+		time.Sleep(2 * time.Second) // wait before retrying
+	}
 	if err != nil {
-		return nil, fmt.Errorf("failed to initialize MinIO client: %w", err)
+		return nil, fmt.Errorf("failed to initialize MinIO client after %d retries: %w", retries, err)
 	}
 	return client, nil
 }
