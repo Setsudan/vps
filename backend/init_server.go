@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -20,10 +19,14 @@ import (
 	"launay-dot-one/repositories"
 
 	authsvc "launay-dot-one/services/auth"
+	"launay-dot-one/services/categories"
+	"launay-dot-one/services/channels"
 	frdsvc "launay-dot-one/services/friendships"
 	groupsvc "launay-dot-one/services/groups" // legacy groups
+	"launay-dot-one/services/guildroles"
 	guildsvc "launay-dot-one/services/guilds" // new guilds
 	msgsrv "launay-dot-one/services/messaging"
+	"launay-dot-one/services/permissions"
 	resumeSvc "launay-dot-one/services/resumes"
 	usersvc "launay-dot-one/services/users"
 
@@ -52,11 +55,11 @@ func InitServer() (*http.Server, error) {
 	}
 
 	// ─── Storage
-	s3Client, err := initS3Client()
+	minioClient, err := initMinioClient()
 	if err != nil {
 		return nil, err
 	}
-	storageSvc, err := initStorageService(s3Client)
+	storageService, err := initStorageService(minioClient)
 	if err != nil {
 		return nil, err
 	}
@@ -76,16 +79,24 @@ func InitServer() (*http.Server, error) {
 	resumeRepo := repositories.NewResumeRepository(db)
 	guildRepo := repositories.NewGuildRepository(db)
 	guildMemberRepo := repositories.NewGuildMemberRepository(db)
+	permRepo := repositories.NewPermissionOverwriteRepository(db)
+	categoryRepo := repositories.NewCategoryRepository(db)
+	channelRepo := repositories.NewChannelRepository(db)
+	guildRoleRepo := repositories.NewGuildRoleRepository(db)
 
 	// ─── Services
 	authService := authsvc.NewService(userRepo, jwtSecret, 72*time.Hour)
-	userService := usersvc.NewService(storageSvc, userRepo)
+	userService := usersvc.NewService(storageService, userRepo)
 	groupService := groupsvc.NewService(groupRepo)
 	friendService := frdsvc.NewService(friendRepo, db)
 	messagingService := msgsrv.NewService(rdb, messagingRepo)
 	resumeService := resumeSvc.NewService(resumeRepo)
 	guildService := guildsvc.NewService(guildRepo, guildMemberRepo)
 	presenceService := realtime.NewPresenceService(rdb)
+	permService := permissions.NewService(permRepo)
+	categoryService := categories.NewService(categoryRepo)
+	channelService := channels.NewService(channelRepo)
+	guildRoleService := guildroles.NewService(guildRoleRepo)
 
 	// ─── Controllers
 	authController := controllers.NewAuthController(authService, logger)
@@ -96,6 +107,10 @@ func InitServer() (*http.Server, error) {
 	resumeController := controllers.NewResumeController(resumeService, logger)
 	friendshipController := controllers.NewFriendshipController(friendService, logger)
 	guildController := controllers.NewGuildController(guildService, logger)
+	permissionsController := controllers.NewPermissionsController(permService, logger)
+	categoryController := controllers.NewCategoriesController(categoryService, logger)
+	channelController := controllers.NewChannelsController(channelService, logger)
+	guildRolesController := controllers.NewGuildRolesController(guildRoleService, logger)
 
 	// ─── Redis‐TTL cleanup & expired listener
 	go func() {
@@ -121,6 +136,10 @@ func InitServer() (*http.Server, error) {
 		resumeController,
 		friendshipController,
 		guildController,
+		permissionsController,
+		categoryController,
+		channelController,
+		guildRolesController,
 	)
 	cors := handlers.CORS(
 		handlers.AllowedOrigins([]string{utils.GetEnv("CORS_ORIGIN", "http://localhost:1420")}),
@@ -164,73 +183,30 @@ func initRedis(logger *logrus.Logger) (*redis.Client, error) {
 	return rdb, nil
 }
 
-func initS3Client() (*minio.Client, error) {
-	rawURL := getEnv("SEAWEEDFS_URL", "http://localhost:8333")
-
+func initMinioClient() (*minio.Client, error) {
+	rawURL := utils.MustEnv("STORAGE_ENDPOINT") // e.g. http://minio:9000
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return nil, fmt.Errorf("invalid SEAWEEDFS_URL %q: %w", rawURL, err)
+		return nil, fmt.Errorf("invalid STORAGE_ENDPOINT %q: %w", rawURL, err)
 	}
 
-	endpoint := u.Host            // host[:port]
-	secure := u.Scheme == "https" // true ↔ HTTPS
-
-	accessKey := os.Getenv("S3_ACCESS_KEY")
-	secretKey := os.Getenv("S3_SECRET_KEY")
-
-	const maxRetries = 5
-	var lastErr error
-
-	for i := 1; i <= maxRetries; i++ {
-		clt, err := minio.New(endpoint, &minio.Options{
-			Creds:  credentials.NewStaticV4(accessKey, secretKey, ""),
-			Secure: secure,
-		})
-		if err == nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			if _, err = clt.ListBuckets(ctx); err == nil {
-				return clt, nil // success
-			}
-		}
-
-		lastErr = err
-		log.Printf("Warning: S3 init failed (%d/%d): %v", i, maxRetries, err)
-		time.Sleep(time.Duration(1<<i) * time.Second) // 2 s, 4 s, 8 s…
+	client, err := minio.New(u.Host, &minio.Options{
+		Creds: credentials.NewStaticV4(
+			os.Getenv("MINIO_ROOT_USER"),
+			os.Getenv("MINIO_ROOT_PASSWORD"),
+			""),
+		Secure: u.Scheme == "https",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize MinIO client: %w", err)
 	}
-	return nil, fmt.Errorf("failed to initialise S3 client: %w", lastErr)
+	return client, nil
 }
 
 func initStorageService(client *minio.Client) (*storage.StorageService, error) {
-	bucket := "avatars"
-	var storageService *storage.StorageService
-
-	go func() {
-		for {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-
-			exists, err := client.BucketExists(ctx, bucket)
-			if err != nil {
-				log.Printf("Warning: error checking bucket existence: %v. Retrying...", err)
-			} else if !exists {
-				if err := client.MakeBucket(ctx, bucket, minio.MakeBucketOptions{}); err != nil {
-					log.Printf("Error creating bucket: %v. Retrying...", err)
-				} else {
-					log.Printf("Bucket '%s' created successfully", bucket)
-					break
-				}
-			} else {
-				log.Printf("Bucket '%s' already exists", bucket)
-				break
-			}
-
-			time.Sleep(10 * time.Second) // Retry after 10 seconds
-		}
-	}()
-
-	storageService = storage.NewStorageService(client, bucket)
-	return storageService, nil
+	bucket := utils.GetEnv("STORAGE_BUCKET", "avatars")
+	svc := storage.NewStorageService(client, bucket)
+	return svc, nil
 }
 
 func initDatabaseWithDefaults() (*gorm.DB, error) {

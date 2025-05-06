@@ -1,73 +1,26 @@
-# Massive rework
+# Massive Rework — progress snapshot (06 May 2025)
 
-## ✅ Done so far
+## ✅ Done
 
-1. **Models**
-
-   * Core: `User`, `Message`
-   * Legacy groups: `models/groups/Group`, `GroupMembership`
-   * Friendships: `models/friendships/FriendRequest`
-   * Guilds system: `models/guilds/Guild`, `GuildRole`, `GuildMember`, `Category`, `Channel`, `PermissionOverwrite`
-   * Resumes: `models/resume/Resume` + submodels (Education, Experience, Project, Certification, Skill, Interest)
-
-2. **Repositories**
-
-   * `UserRepository`, `MessagingRepository`, `GroupRepository`, `GroupMembershipRepository`
-   * `FriendRequestRepository`, `GuildRepository`, `GuildMemberRepository`
-   * `CategoryRepository`, `ChannelRepository`, `PermissionOverwriteRepository`
-   * `ResumeRepository`
-
-3. **Services**
-
-   * **Auth** (register/login/JWT)
-   * **Users** (avatar, list, get, update profile)
-   * **Legacy Groups** (create/list/update/delete + membership)
-   * **Friendships** (send/respond/list requests & friends)
-   * **Messaging** (Redis-backed send, reactions, history, transfer)
-   * **Presence** (online/offline via Redis TTL + WS)
-   * **Resumes** (CRUD per user)
-   * **Guilds** (create/list/update/delete + membership roles)
-
-4. **Controllers**
-
-   * **Helpers** (`parseJWT`, `buildUpgrader`)
-   * **AuthController**, **UserController**, **MessagingController**, **PresenceController**
-   * **GroupController** (legacy groups)
-   * **FriendshipController**, **ResumeController**, **GuildController**
-
-5. **Boot & Routing**
-
-   * `init_server.go` wired all repos, services, controllers, DB migrations, Redis listeners
-   * `router.go` registers routes for health, auth, presence, users, messaging, groups, resumes, friendships, guilds
+| Area               | Details                                                                                                                                                                                                                                                          |
+| ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Models**         | Core `User`, `Message`; legacy `Group` + `GroupMembership`; friendship `FriendRequest`; guilds (`Guild`, `GuildRole`, `GuildMember`, `Category`, `Channel`, `PermissionOverwrite`); résumé aggregate + sub‑models                                                |
+| **Repositories**   | User, Messaging, Group, GroupMembership, FriendRequest, Guild, GuildMember, Category, Channel, PermissionOverwrite, Resume                                                                                                                                       |
+| **Services**       | Auth · Users · Legacy Groups · Friendships · Messaging (Redis) · Presence · Résumés · Guilds · **Permissions** · **Categories** · **Channels** · **Guild‑Roles**                                                                                                 |
+| **Controllers**    | Helpers · Auth · User · Messaging · Presence · Group (legacy) · Friendship · Resume · Guild · **Permissions** · **Categories** · **Channels** · **GuildRoles**                                                                                                   |
+| **Boot & Routing** | `init_server.go` wires every new repo/service/controller; Redis TTL goroutine + expired‑key listener; Traefik stack rebuilt: <br>• API served under `/api/*` <br>• MinIO exposed at `/storage/*` <br>• Bucket initialised once via `minio-init` helper container |
+| **Storage**        | `StorageService` simplified (no bucket ops); public read + write policy applied once by `minio-init`                                                                                                                                                             |
 
 ---
 
-## 🏗️ Still to do
+## 🪣 Open TODOS & Known Issues
 
-1. **Permissions**
-
-   * Service & controller for `PermissionOverwrite` endpoints.
-
-2. **Categories**
-
-   * Service & controller for guild‐categories (CRUD).
-
-3. **Channels**
-
-   * Service & controller for text/audio channels (CRUD).
-
-4. **Role Management**
-
-   * Endpoints for `GuildRole` (create/list/update/delete) under `/guilds/:guild_id/roles`.
-
-5. **Integration**
-
-   * Hook the new permissions/categories/channels controllers into `init_server.go` and `router.go`.
-
-6. **Messaging & Group Rework**
-
-   * Adapt legacy messaging/group flows to respect friendships and guild permissions.
-
-7. **Docs & Tests**
-
-   * (Optional) Swagger/OpenAPI spec, unit & integration tests.
+|  Priority  | Item / Bug                                                        | Notes / Next step                                                                                                                                                                                             |
+| ---------- | ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 🔴 **P0**  | **Avatar upload → "Access Denied"**                               | Bucket is public‑read only; API needs `s3:PutObject`.<br/>  `mc anonymous set public local/$STORAGE_BUCKET` **or**<br/>  create a write‑enabled service user and use those creds in `go_launay`.          |
+| 🔴 **P0**  | **Guild creator is not owner/admin**                              | `GuildService.CreateGuild` must: <br/>  set `guild.CreatorID = userID` <br/>  auto‑create a `GuildMember{RoleIDs:[adminRoleID]}` entry for the creator.                                                   |
+| 🟠 **P1**  | `POST /guilds/:id/roles` → *"cannot unmarshal array into uint64"* | JSON payload's `permissions` field should be **number or bit‑string**, not array. <br/>  Update DTO & binding struct to `[]uint64` **or** accept a combined `uint64` bit‑mask.                              |
+| 🟠 **P1**  | **Categories ↔ Channels relation**                                | Current CRUD treats them separately. <br/>  `CategoryService.Create` should accept an optional slice of channels. <br/>  `ChannelService.Create` should require a `category_id` (nullable for top‑level). |
+| 🟡 **P2**  | **Messaging / conversations untested**                            | Need manual / Postman flow: WS connect, send, reaction, Redis TTL → PG transfer.                                                                                                                              |
+| 🟡 **P2**  | Migrate legacy "Groups" to new Guilds (optional)                  | Decide if legacy stays or is deprecated.                                                                                                                                                                      |
+| 🟡 **P2**  | Swagger / tests                                                   | OpenAPI spec + unit/integration tests.                                                                                                                                                                        |

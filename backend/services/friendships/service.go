@@ -7,6 +7,7 @@ import (
 	mfriend "launay-dot-one/models/friendships"
 	"launay-dot-one/repositories"
 
+	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
 
@@ -26,7 +27,7 @@ func (s *service) SendRequest(ctx context.Context, fromID, toID string) error {
 	}
 
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		// Check for existing pending/accepted request
+		// 1) check duplicates (unchanged)
 		existing, err := s.repo.ListForUser(ctx, fromID)
 		if err != nil {
 			return err
@@ -34,14 +35,17 @@ func (s *service) SendRequest(ctx context.Context, fromID, toID string) error {
 		for _, r := range existing {
 			samePair := (r.RequesterID == fromID && r.ReceiverID == toID) ||
 				(r.RequesterID == toID && r.ReceiverID == fromID)
-			if samePair && (r.Status == mfriend.FriendPending || r.Status == mfriend.FriendAccepted) {
+			if samePair && (r.Status == string(mfriend.FriendPending) || r.Status == string(mfriend.FriendAccepted)) {
 				return errors.New("friend request already exists")
 			}
 		}
+
+		// 2) build the new request — ***populate ID here***
 		fr := &mfriend.FriendRequest{
+			ID:          uuid.NewString(),
 			RequesterID: fromID,
 			ReceiverID:  toID,
-			Status:      mfriend.FriendPending,
+			Status:      string(mfriend.FriendPending),
 		}
 		return s.repo.Create(ctx, fr)
 	})
@@ -70,7 +74,7 @@ func (s *service) ListRequests(ctx context.Context, userID string) ([]RequestDTO
 			ID:          r.ID,
 			RequesterID: r.RequesterID,
 			ReceiverID:  r.ReceiverID,
-			Status:      r.Status,
+			Status:      mfriend.FriendStatus(r.Status),
 		}
 	}
 	return out, nil

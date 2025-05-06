@@ -6,24 +6,19 @@ services:
     image: "${REDIS_IMAGE}:${REDIS_TAG}"
     command:
       - redis-server
-      - --appendonly
-      - "yes"
-      - --notify-keyspace-events
-      - "Ex"
+      - --appendonly yes
+      - --notify-keyspace-events Ex
     volumes:
       - redis:/data
-    networks: [internal]
-    expose: ["6379"]
+    networks:
+      - internal
+    expose:
+      - "6379"
     healthcheck:
       test: ["CMD", "redis-cli", "PING"]
       interval: 10s
       timeout: 3s
       retries: 3
-    deploy:
-      resources:
-        limits:
-          cpus: "0.50"
-          memory: 256M
 
   db:
     image: "${POSTGRES_IMAGE}:${POSTGRES_TAG}"
@@ -33,65 +28,92 @@ services:
       POSTGRES_PASSWORD: "${DB_PASSWORD}"
     volumes:
       - pgdata:/var/lib/postgresql/data
-    networks: [internal]
-    expose: ["5432"] # no host‑port published
+    networks:
+      - internal
+    expose:
+      - "5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
       interval: 10s
       timeout: 5s
       retries: 5
-    deploy:
-      resources:
-        limits:
-          cpus: "1.0"
-          memory: 512M
 
-  seaweedfs:
-    image: "${SEAWEED_IMAGE}:${SEAWEED_TAG}"
-    command:
-      - server
-      - "-ip=0.0.0.0"
-      - "-master.port=${SEAWEED_MASTER_PORT}"
-      - "-filer"
-      - "-filer.port=${SEAWEED_FILER_PORT}"
-      - "-s3"
-      - "-s3.port=${SEAWEED_S3_PORT}"
+  # -------------------------------------------------
+  # OBJECT STORAGE — MinIO
+  # -------------------------------------------------
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: "${MINIO_ROOT_USER}"
+      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD}"
     volumes:
-      - seaweedfs:/data
-    networks: [internal]
-    expose: ["${SEAWEED_S3_PORT}"] # internal only
+      - minio_data:/data
+    networks:
+      - internal
+      - web
+    expose:
+      - "9000" # S3 API
+      - "9001" # console UI
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=web"
+      - "traefik.http.routers.storage.rule=Host(`${APP_DOMAIN}`, `localhost`) && PathPrefix(`/storage`)"
+      - "traefik.http.routers.storage.entrypoints=web,websecure"
+      - "traefik.http.routers.storage.tls=true"
+      - "traefik.http.routers.storage.priority=100"
+      - "traefik.http.services.storage.loadBalancer.server.port=9000"
     healthcheck:
-      test: ["CMD", "nc", "-z", "localhost", "${SEAWEED_S3_PORT}"]
+      test:
+        - "CMD-SHELL"
+        - "mc alias set local http://127.0.0.1:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD} >/dev/null"
       interval: 15s
       timeout: 5s
       retries: 5
-    deploy:
-      resources:
-        limits:
-          cpus: "1.0"
-          memory: 512M
 
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_started
+    networks: [internal]
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD &&
+      mc mb --ignore-existing local/${STORAGE_BUCKET} &&
+      mc anonymous set public local/${STORAGE_BUCKET} &&
+      echo '✔ MinIO bucket \"${STORAGE_BUCKET}\" ready (public read+write)';
+      "
+    environment:
+      - STORAGE_BUCKET=${STORAGE_BUCKET}
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
   # -------------------------------------------------
-  # APPLICATION API
+  # APPLICATION API (behind /api)
   # -------------------------------------------------
   go_launay:
     build:
-      context: "${APP_BUILD_CONTEXT}"
-      dockerfile: "${APP_DOCKERFILE}"
+      context: "./backend"
+      dockerfile: "Dockerfile"
     image: go_launay
     restart: always
-    labels:
-      - traefik.enable=true
-      - traefik.http.routers.go.rule=Host(`${APP_DOMAIN}`, `localhost`) && PathPrefix(`/`)
-      - traefik.http.routers.go.entrypoints=web
-      - traefik.http.services.go.loadBalancer.server.port=8080
-      - traefik.docker.network=web
+    networks:
+      - web
+      - internal
+    expose:
+      - "${APP_PORT}"
+    ports:
+      - "${APP_PORT}:${APP_PORT}"
+    depends_on:
+      redis:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
     environment:
       REDIS_ADDRESS: "redis:6379"
       REDIS_PASSWORD: "${REDIS_PASSWORD}"
-      JWT_SECRET: "${JWT_SECRET}"
-      APP_PORT: "${APP_PORT}"
-      SEAWEEDFS_URL: "http://seaweedfs:${SEAWEED_S3_PORT}"
       DB_HOST: "db"
       DB_USER: "${DB_USER}"
       DB_PASSWORD: "${DB_PASSWORD}"
@@ -99,26 +121,29 @@ services:
       DB_PORT: "5432"
       DB_SSLMODE: "disable"
       DB_TIMEZONE: "${DB_TIMEZONE}"
-      WS_ALLOWED_ORIGINS: "*" # TODO: set to frontend URL
-    ports:
-      - "${APP_PORT}:${APP_PORT}"
-    expose:
-      - "${APP_PORT}"
-    networks:
-      - web
-      - internal
-    depends_on:
-      redis:
-        condition: service_healthy
-      db:
-        condition: service_healthy
-      seaweedfs:
-        condition: service_healthy
-    deploy:
-      resources:
-        limits:
-          cpus: "1.0"
-          memory: 512M
+      JWT_SECRET: "${JWT_SECRET}"
+      APP_PORT: "${APP_PORT}"
+      WS_ALLOWED_ORIGINS: "*"
+      STORAGE_ENDPOINT: "http://minio:9000"
+      STORAGE_BUCKET: "avatars"
+      STORAGE_PUBLIC_URL: "https://${APP_DOMAIN}/storage"
+    labels:
+      - "traefik.enable=true"
+      # 1) Redirect root "/" → "/api/"
+      - "traefik.http.routers.api-redirect.rule=Host(`${APP_DOMAIN}`, `localhost`) && Path(`/`)"
+      - "traefik.http.routers.api-redirect.entrypoints=web,websecure"
+      - "traefik.http.middlewares.redirect-to-api.redirectregex.regex=^/$"
+      - "traefik.http.middlewares.redirect-to-api.redirectregex.replacement=/api/"
+      - "traefik.http.routers.api-redirect.middlewares=redirect-to-api"
+      - "traefik.http.routers.api-redirect.priority=50"
+      # 2) Serve API under /api
+      - "traefik.http.middlewares.strip-api.stripprefix.prefixes=/api"
+      - "traefik.http.routers.go.rule=Host(`${APP_DOMAIN}`, `localhost`) && PathPrefix(`/api`)"
+      - "traefik.http.routers.go.entrypoints=web,websecure"
+      - "traefik.http.routers.go.middlewares=strip-api"
+      - "traefik.http.routers.go.priority=10"
+      - "traefik.http.services.go.loadBalancer.server.port=8080"
+      - "traefik.docker.network=web"
 
   # -------------------------------------------------
   # EDGE ROUTER
@@ -134,25 +159,18 @@ services:
       - --certificatesresolvers.myresolver.acme.email=${LE_EMAIL}
       - --certificatesresolvers.myresolver.acme.storage=/letsencrypt/acme.json
       - --api.dashboard=true
-      - --api.insecure=true # TODO: set to false in production
+      - --api.insecure=true
     ports:
       - "80:80"
       - "443:443"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./letsencrypt:/letsencrypt
-    networks: [web]
+    networks:
+      - web
     depends_on:
       - go_launay
-    deploy:
-      resources:
-        limits:
-          cpus: "0.50"
-          memory: 256M
 
-# -------------------------------------------------
-# NETWORKS / VOLUMES
-# -------------------------------------------------
 networks:
   internal:
     internal: true
@@ -162,4 +180,4 @@ networks:
 volumes:
   pgdata:
   redis:
-  seaweedfs:
+  minio_data:

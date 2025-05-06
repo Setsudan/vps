@@ -19,6 +19,10 @@ func SetupRouter(
 	resumeController *controllers.ResumeController,
 	friendshipController *controllers.FriendshipController,
 	guildController *controllers.GuildController,
+	permsController *controllers.PermissionsController,
+	categoryController *controllers.CategoriesController,
+	channelController *controllers.ChannelsController,
+	guildRolesController *controllers.GuildRolesController,
 ) *gin.Engine {
 	router := gin.New()
 	router.Use(gin.Recovery(), middlewares.Logger())
@@ -39,6 +43,10 @@ func SetupRouter(
 	resumeController.RegisterRoutes(router)
 	friendshipController.RegisterRoutes(router)
 	guildController.RegisterRoutes(router)
+	permsController.RegisterRoutes(router)
+	categoryController.RegisterRoutes(router)
+	channelController.RegisterRoutes(router)
+	guildRolesController.RegisterRoutes(router)
 
 	// Presence WS & helper
 	router.GET("/presence", gin.WrapF(presenceController.GetAllPresence))
