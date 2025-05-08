@@ -12,6 +12,8 @@ import (
 	"launay-dot-one/utils"
 )
 
+const channelIDParam = "/:channel_id"
+
 type ChannelsController struct {
 	svc    chsvc.Service
 	logger *logrus.Logger
@@ -33,13 +35,32 @@ func (cc *ChannelsController) RegisterRoutes(r *gin.Engine) {
 	{
 		c.GET("", cc.ListByCategory)
 	}
-	// Single‐channel operations
+	// Single-channel operations
 	single := r.Group("/channels", middlewares.AuthMiddleware())
 	{
-		single.GET("/:channel_id", cc.Get)
-		single.PUT("/:channel_id", cc.Update)
-		single.DELETE("/:channel_id", cc.Delete)
+		single.GET(channelIDParam, cc.Get)
+		single.PUT(channelIDParam, cc.Update)
+		single.DELETE(channelIDParam, cc.Delete)
 	}
+}
+
+func (cc *ChannelsController) Create(c *gin.Context) {
+	guildID := c.Param("guild_id")
+
+	var ch guilds.Channel
+	if err := c.ShouldBindJSON(&ch); err != nil {
+		utils.RespondError(c, http.StatusBadRequest, "Invalid payload", err.Error())
+		return
+	}
+	ch.GuildID = guildID
+
+	// Pass nil for categoryID → top-level channel
+	if err := cc.svc.Create(c.Request.Context(), &ch, nil); err != nil {
+		cc.logger.Error("Create channel error: ", err)
+		utils.RespondError(c, http.StatusInternalServerError, "Failed to create channel", err.Error())
+		return
+	}
+	utils.RespondSuccess(c, http.StatusCreated, "Channel created", ch)
 }
 
 func (cc *ChannelsController) ListByGuild(c *gin.Context) {
@@ -62,22 +83,6 @@ func (cc *ChannelsController) ListByCategory(c *gin.Context) {
 		return
 	}
 	utils.RespondSuccess(c, http.StatusOK, "Channels fetched", out)
-}
-
-func (cc *ChannelsController) Create(c *gin.Context) {
-	gid := c.Param("guild_id")
-	var ch guilds.Channel
-	if err := c.ShouldBindJSON(&ch); err != nil {
-		utils.RespondError(c, http.StatusBadRequest, "Invalid payload", err.Error())
-		return
-	}
-	ch.GuildID = gid
-	if err := cc.svc.Create(c.Request.Context(), &ch); err != nil {
-		cc.logger.Error("Create channel error: ", err)
-		utils.RespondError(c, http.StatusInternalServerError, "Failed to create channel", err.Error())
-		return
-	}
-	utils.RespondSuccess(c, http.StatusCreated, "Channel created", ch)
 }
 
 func (cc *ChannelsController) Get(c *gin.Context) {

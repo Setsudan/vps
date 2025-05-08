@@ -7,7 +7,7 @@ import (
 )
 
 type Service interface {
-	Create(ctx context.Context, c *guilds.Category) error
+	Create(ctx context.Context, c *guilds.Category, channels []*guilds.Channel) error
 	Get(ctx context.Context, id string) (*guilds.Category, error)
 	List(ctx context.Context, guildID string) ([]guilds.Category, error)
 	Update(ctx context.Context, c *guilds.Category) error

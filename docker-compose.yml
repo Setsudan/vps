@@ -77,17 +77,23 @@ services:
       minio:
         condition: service_started
     networks: [internal]
-    entrypoint: >
-      /bin/sh -c "
-      mc alias set local http://minio:9000 $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD &&
-      mc mb --ignore-existing local/${STORAGE_BUCKET} &&
-      mc anonymous set public local/${STORAGE_BUCKET} &&
-      echo '✔ MinIO bucket \"${STORAGE_BUCKET}\" ready (public read+write)';
-      "
     environment:
       - STORAGE_BUCKET=${STORAGE_BUCKET}
       - MINIO_ROOT_USER=${MINIO_ROOT_USER}
       - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+      - MINIO_UPLOAD_USER=${MINIO_UPLOAD_USER}
+      - MINIO_UPLOAD_PASSWORD=${MINIO_UPLOAD_PASSWORD}
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 \
+          $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD &&
+        mc admin user add local \
+          $MINIO_UPLOAD_USER $MINIO_UPLOAD_PASSWORD &&
+        mc admin policy set local writeonly user=$MINIO_UPLOAD_USER &&
+        mc mb --ignore-existing local/${STORAGE_BUCKET} &&
+        mc anonymous set download local/${STORAGE_BUCKET} &&
+        echo '✔ MinIO bucket \"${STORAGE_BUCKET}\" ready; upload user created';
+      "
   # -------------------------------------------------
   # APPLICATION API (behind /api)
   # -------------------------------------------------
@@ -127,6 +133,8 @@ services:
       STORAGE_ENDPOINT: "http://minio:9000"
       STORAGE_BUCKET: "avatars"
       STORAGE_PUBLIC_URL: "https://${APP_DOMAIN}/storage"
+      MINIO_UPLOAD_USER: "${MINIO_UPLOAD_USER}"
+      MINIO_UPLOAD_PASSWORD: "${MINIO_UPLOAD_PASSWORD}"
     labels:
       - "traefik.enable=true"
       # 1) Redirect root "/" → "/api/"

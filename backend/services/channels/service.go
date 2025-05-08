@@ -15,7 +15,12 @@ func NewService(repo *repositories.ChannelRepository) Service {
 	return &service{repo}
 }
 
-func (s *service) Create(ctx context.Context, ch *guilds.Channel) error {
+func (s *service) Create(
+	ctx context.Context,
+	ch *guilds.Channel,
+	categoryID *string,
+) error {
+	ch.CategoryID = categoryID
 	return s.repo.Create(ctx, ch)
 }
 

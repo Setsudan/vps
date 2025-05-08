@@ -12,6 +12,8 @@ import (
 	"launay-dot-one/utils"
 )
 
+const categoryIDParam = "/:category_id"
+
 type CategoriesController struct {
 	svc    catsvc.Service
 	logger *logrus.Logger
@@ -26,10 +28,45 @@ func (cc *CategoriesController) RegisterRoutes(r *gin.Engine) {
 	{
 		grp.GET("", cc.List)
 		grp.POST("", cc.Create)
-		grp.GET("/:category_id", cc.Get)
-		grp.PUT("/:category_id", cc.Update)
-		grp.DELETE("/:category_id", cc.Delete)
+		grp.GET(categoryIDParam, cc.Get)
+		grp.PUT(categoryIDParam, cc.Update)
+		grp.DELETE(categoryIDParam, cc.Delete)
 	}
+}
+
+func (cc *CategoriesController) Create(c *gin.Context) {
+	guildID := c.Param("guild_id")
+
+	// Payload now includes optional Channels slice
+	var payload struct {
+		Name     string            `json:"name" binding:"required"`
+		Position int               `json:"position" binding:"required"`
+		Channels []*guilds.Channel `json:"channels,omitempty"`
+	}
+	if err := c.ShouldBindJSON(&payload); err != nil {
+		utils.RespondError(c, http.StatusBadRequest, "Invalid payload", err.Error())
+		return
+	}
+
+	// Build the Category
+	category := guilds.Category{
+		GuildID:  guildID,
+		Name:     payload.Name,
+		Position: payload.Position,
+	}
+
+	// Ensure each channel knows its guild
+	for _, ch := range payload.Channels {
+		ch.GuildID = guildID
+	}
+
+	// Pass channels slice into service
+	if err := cc.svc.Create(c.Request.Context(), &category, payload.Channels); err != nil {
+		cc.logger.Error("Create category error: ", err)
+		utils.RespondError(c, http.StatusInternalServerError, "Failed to create category", err.Error())
+		return
+	}
+	utils.RespondSuccess(c, http.StatusCreated, "Category created", category)
 }
 
 func (cc *CategoriesController) List(c *gin.Context) {
@@ -41,22 +78,6 @@ func (cc *CategoriesController) List(c *gin.Context) {
 		return
 	}
 	utils.RespondSuccess(c, http.StatusOK, "Categories fetched", out)
-}
-
-func (cc *CategoriesController) Create(c *gin.Context) {
-	guildID := c.Param("guild_id")
-	var cat guilds.Category
-	if err := c.ShouldBindJSON(&cat); err != nil {
-		utils.RespondError(c, http.StatusBadRequest, "Invalid payload", err.Error())
-		return
-	}
-	cat.GuildID = guildID
-	if err := cc.svc.Create(c.Request.Context(), &cat); err != nil {
-		cc.logger.Error("Create category error: ", err)
-		utils.RespondError(c, http.StatusInternalServerError, "Failed to create category", err.Error())
-		return
-	}
-	utils.RespondSuccess(c, http.StatusCreated, "Category created", cat)
 }
 
 func (cc *CategoriesController) Get(c *gin.Context) {

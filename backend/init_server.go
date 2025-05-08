@@ -94,7 +94,7 @@ func InitServer() (*http.Server, error) {
 	guildService := guildsvc.NewService(guildRepo, guildMemberRepo)
 	presenceService := realtime.NewPresenceService(rdb)
 	permService := permissions.NewService(permRepo)
-	categoryService := categories.NewService(categoryRepo)
+	categoryService := categories.NewService(categoryRepo, channelRepo)
 	channelService := channels.NewService(channelRepo)
 	guildRoleService := guildroles.NewService(guildRoleRepo)
 
@@ -157,13 +157,6 @@ func InitServer() (*http.Server, error) {
 	return srv, nil
 }
 
-func loadEnv() error {
-	if err := godotenv.Load(); err != nil {
-		return fmt.Errorf("no .env file found, using environment variables")
-	}
-	return nil
-}
-
 func initRedis(logger *logrus.Logger) (*redis.Client, error) {
 	rdb := redis.NewClient(&redis.Options{
 		Addr:     getEnv("REDIS_ADDRESS", "localhost:6379"),
@@ -190,23 +183,32 @@ func initMinioClient() (*minio.Client, error) {
 		return nil, fmt.Errorf("invalid STORAGE_ENDPOINT %q: %w", rawURL, err)
 	}
 
+	// choose upload-only user if provided, else fallback to root
+	accessKey := os.Getenv("MINIO_UPLOAD_USER")
+	secretKey := os.Getenv("MINIO_UPLOAD_PASSWORD")
+	if accessKey == "" || secretKey == "" {
+		accessKey = os.Getenv("MINIO_ROOT_USER")
+		secretKey = os.Getenv("MINIO_ROOT_PASSWORD")
+	}
+
+	retries := 5
 	var client *minio.Client
-	retries := 3
 	for i := 0; i < retries; i++ {
 		client, err = minio.New(u.Host, &minio.Options{
-			Creds: credentials.NewStaticV4(
-				os.Getenv("MINIO_ROOT_USER"),
-				os.Getenv("MINIO_ROOT_PASSWORD"),
-				""),
+			Creds:  credentials.NewStaticV4(accessKey, secretKey, ""),
 			Secure: u.Scheme == "https",
 		})
 		if err == nil {
 			break
 		}
-		time.Sleep(2 * time.Second) // wait before retrying
+		time.Sleep(2 * time.Second)
 	}
+
 	if client == nil || err != nil {
-		return nil, fmt.Errorf("failed to initialize MinIO client after %d retries: %w", retries, err)
+		return nil, fmt.Errorf(
+			"failed to initialize MinIO client after %d retries: %w",
+			retries, err,
+		)
 	}
 	return client, nil
 }
