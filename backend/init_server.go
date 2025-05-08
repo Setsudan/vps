@@ -205,7 +205,7 @@ func initMinioClient() (*minio.Client, error) {
 		}
 		time.Sleep(2 * time.Second) // wait before retrying
 	}
-	if err != nil {
+	if client == nil || err != nil {
 		return nil, fmt.Errorf("failed to initialize MinIO client after %d retries: %w", retries, err)
 	}
 	return client, nil

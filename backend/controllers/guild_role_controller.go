@@ -17,6 +17,14 @@ type GuildRolesController struct {
 	logger *logrus.Logger
 }
 
+type rolePayload struct {
+	Name        string   `json:"name" binding:"required"`
+	Permissions []uint64 `json:"permissions"`
+	Color       int      `json:"color"`
+	Hoist       bool     `json:"hoist"`
+	Position    int      `json:"position"`
+}
+
 func NewGuildRolesController(svc grsvc.Service, logger *logrus.Logger) *GuildRolesController {
 	return &GuildRolesController{svc, logger}
 }
@@ -45,18 +53,67 @@ func (rc *GuildRolesController) List(c *gin.Context) {
 
 func (rc *GuildRolesController) Create(c *gin.Context) {
 	guildID := c.Param("guild_id")
-	var role guilds.GuildRole
-	if err := c.ShouldBindJSON(&role); err != nil {
+
+	var in rolePayload
+	if err := c.ShouldBindJSON(&in); err != nil {
 		utils.RespondError(c, http.StatusBadRequest, "Invalid payload", err.Error())
 		return
 	}
-	role.GuildID = guildID
+
+	// OR-fold the slice into a single uint64 bitmask
+	var mask uint64
+	for _, p := range in.Permissions {
+		mask |= p
+	}
+
+	role := guilds.GuildRole{
+		GuildID:     guildID,
+		Name:        in.Name,
+		Permissions: mask, // ← packed mask
+		Color:       in.Color,
+		Hoist:       in.Hoist,
+		Position:    in.Position,
+	}
+
 	if err := rc.svc.Create(c.Request.Context(), &role); err != nil {
 		rc.logger.Error("Create role error: ", err)
 		utils.RespondError(c, http.StatusInternalServerError, "Failed to create role", err.Error())
 		return
 	}
 	utils.RespondSuccess(c, http.StatusCreated, "Role created", role)
+}
+
+func (rc *GuildRolesController) Update(c *gin.Context) {
+	guildID := c.Param("guild_id")
+	roleID := c.Param("role_id")
+
+	var in rolePayload
+	if err := c.ShouldBindJSON(&in); err != nil {
+		utils.RespondError(c, http.StatusBadRequest, "Invalid payload", err.Error())
+		return
+	}
+
+	var mask uint64
+	for _, p := range in.Permissions {
+		mask |= p
+	}
+
+	role := guilds.GuildRole{
+		ID:          roleID,
+		GuildID:     guildID,
+		Name:        in.Name,
+		Permissions: mask,
+		Color:       in.Color,
+		Hoist:       in.Hoist,
+		Position:    in.Position,
+	}
+
+	if err := rc.svc.Update(c.Request.Context(), &role); err != nil {
+		rc.logger.Error("Update role error: ", err)
+		utils.RespondError(c, http.StatusInternalServerError, "Failed to update role", err.Error())
+		return
+	}
+	utils.RespondSuccess(c, http.StatusOK, "Role updated", role)
 }
 
 func (rc *GuildRolesController) Get(c *gin.Context) {
@@ -68,24 +125,6 @@ func (rc *GuildRolesController) Get(c *gin.Context) {
 		return
 	}
 	utils.RespondSuccess(c, http.StatusOK, "Role fetched", role)
-}
-
-func (rc *GuildRolesController) Update(c *gin.Context) {
-	guildID := c.Param("guild_id")
-	roleID := c.Param("role_id")
-	var role guilds.GuildRole
-	if err := c.ShouldBindJSON(&role); err != nil {
-		utils.RespondError(c, http.StatusBadRequest, "Invalid payload", err.Error())
-		return
-	}
-	role.ID = roleID
-	role.GuildID = guildID
-	if err := rc.svc.Update(c.Request.Context(), &role); err != nil {
-		rc.logger.Error("Update role error: ", err)
-		utils.RespondError(c, http.StatusInternalServerError, "Failed to update role", err.Error())
-		return
-	}
-	utils.RespondSuccess(c, http.StatusOK, "Role updated", role)
 }
 
 func (rc *GuildRolesController) Delete(c *gin.Context) {

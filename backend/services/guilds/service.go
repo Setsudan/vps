@@ -31,6 +31,7 @@ func NewService(
 func (s *service) CreateGuild(ctx context.Context, guild *guilds.Guild, ownerID string) error {
 	guild.ID = uuid.NewString()
 	now := time.Now()
+	guild.OwnerID = ownerID
 	guild.CreatedAt = now
 	guild.UpdatedAt = now
 
