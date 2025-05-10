@@ -3,68 +3,54 @@ package middlewares
 import (
 	"fmt"
 	"net/http"
-	"os"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v4"
+
+	"launay-dot-one/utils"
 )
 
 func AuthMiddleware() gin.HandlerFunc {
-	secret := os.Getenv("JWT_SECRET")
-	if secret == "" {
-		panic("JWT_SECRET environment variable is not set")
-	}
+	// capture the secret once
+	secret := []byte(utils.MustEnv("JWT_SECRET"))
 
 	return func(c *gin.Context) {
-		authHeader := c.GetHeader("Authorization")
-		if authHeader == "" {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-				"code":    http.StatusUnauthorized,
-				"message": "Unauthorized",
-				"error":   "Missing Authorization header",
-			})
+		auth := c.GetHeader("Authorization")
+		if !strings.HasPrefix(auth, "Bearer ") {
+			utils.RespondError(c, http.StatusUnauthorized, "Unauthorized", "Missing or invalid Authorization header")
+			c.Abort()
 			return
 		}
 
-		parts := strings.Split(authHeader, " ")
-		if len(parts) != 2 || parts[0] != "Bearer" {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-				"code":    http.StatusUnauthorized,
-				"message": "Unauthorized",
-				"error":   "Invalid Authorization header format",
-			})
-			return
-		}
-
-		tokenStr := parts[1]
-		token, err := jwt.Parse(tokenStr, func(token *jwt.Token) (interface{}, error) {
-			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-				return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+		tokenStr := strings.TrimPrefix(auth, "Bearer ")
+		tok, err := jwt.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {
+			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
 			}
-			return []byte(secret), nil
+			return secret, nil
 		})
-
-		if err != nil || !token.Valid {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-				"code":    http.StatusUnauthorized,
-				"message": "Unauthorized",
-				"error":   "Invalid or expired token",
-			})
+		if err != nil || !tok.Valid {
+			utils.RespondError(c, http.StatusUnauthorized, "Unauthorized", err.Error())
+			c.Abort()
 			return
 		}
 
-		claims, ok := token.Claims.(jwt.MapClaims)
-		if !ok || claims["user_id"] == nil {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-				"code":    http.StatusUnauthorized,
-				"message": "Unauthorized",
-				"error":   "Missing user_id in token claims",
-			})
+		claims, ok := tok.Claims.(jwt.MapClaims)
+		if !ok {
+			utils.RespondError(c, http.StatusUnauthorized, "Unauthorized", "Invalid token claims")
+			c.Abort()
 			return
 		}
 
-		c.Set("user_id", claims["user_id"].(string))
+		userID, ok := claims["user_id"].(string)
+		if !ok || userID == "" {
+			utils.RespondError(c, http.StatusUnauthorized, "Unauthorized", "Missing user_id claim")
+			c.Abort()
+			return
+		}
+
+		c.Set("user_id", userID)
 		c.Next()
 	}
 }

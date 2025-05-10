@@ -2,8 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -12,15 +12,32 @@ import (
 	"launay-dot-one/controllers"
 	"launay-dot-one/listeners"
 	"launay-dot-one/models"
+	"launay-dot-one/models/friendships"
+	"launay-dot-one/models/groups"
+	"launay-dot-one/models/guilds"
+	"launay-dot-one/models/resume"
 	"launay-dot-one/realtime"
 	"launay-dot-one/repositories"
-	"launay-dot-one/services"
+
+	authsvc "launay-dot-one/services/auth"
+	"launay-dot-one/services/categories"
+	"launay-dot-one/services/channels"
+	frdsvc "launay-dot-one/services/friendships"
+	groupsvc "launay-dot-one/services/groups" // legacy groups
+	"launay-dot-one/services/guildroles"
+	guildsvc "launay-dot-one/services/guilds" // new guilds
+	msgsrv "launay-dot-one/services/messaging"
+	"launay-dot-one/services/permissions"
+	resumeSvc "launay-dot-one/services/resumes"
+	usersvc "launay-dot-one/services/users"
+
 	"launay-dot-one/storage"
 	"launay-dot-one/utils"
 
 	"github.com/go-redis/redis/v8"
 	"github.com/gorilla/handlers"
 	"github.com/joho/godotenv"
+	"github.com/minio/madmin-go"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/sirupsen/logrus"
@@ -28,101 +45,131 @@ import (
 	"gorm.io/gorm"
 )
 
-// InitServer initializes dependencies and returns an HTTP server.
 func InitServer() (*http.Server, error) {
-	if err := loadEnv(); err != nil {
-		log.Println(err)
-	}
-
-	var jwtSecret = []byte(utils.MustEnv("JWT_SECRET"))
+	_ = godotenv.Load() // ignore missing .env
+	jwtSecret := utils.MustEnv("JWT_SECRET")
 	logger := utils.GetLogger()
 
+	// ─── Redis
 	rdb, err := initRedis(logger)
 	if err != nil {
 		return nil, err
 	}
 
-	s3Client, err := initS3Client()
+	// ─── Storage
+	minioClient, err := initMinioClient()
 	if err != nil {
 		return nil, err
 	}
 
-	storageService, err := initStorageService(s3Client)
+	if err := bootstrapMinio(
+		context.Background(),
+		utils.MustEnv("STORAGE_ENDPOINT"), // e.g. http://minio:9000
+		utils.MustEnv("MINIO_ROOT_USER"),
+		utils.MustEnv("MINIO_ROOT_PASSWORD"),
+		utils.GetEnv("STORAGE_BUCKET", "avatars"),
+		os.Getenv("MINIO_UPLOAD_USER"),
+		os.Getenv("MINIO_UPLOAD_PASSWORD"),
+	); err != nil {
+		logger.Fatalf("MinIO bootstrap failed: %v", err)
+	}
+
+	storageService, err := initStorageService(minioClient)
 	if err != nil {
 		return nil, err
 	}
 
+	// ─── Database & Migrations
 	db, err := initDatabaseWithDefaults()
 	if err != nil {
-		logger.Fatal("Database initialization with defaults failed: ", err)
+		logger.Fatal("Database init failed: ", err)
 		return nil, err
 	}
 
-	// Initialize repositories.
-	groupRepo := repositories.NewGroupRepository(db)
+	// ─── Repositories
+	userRepo := repositories.NewUserRepository(db)
+	groupRepo := repositories.NewGroupRepository(db) // legacy groups
 	messagingRepo := repositories.NewMessagingRepository(db)
+	friendRepo := repositories.NewFriendRequestRepository(db)
+	resumeRepo := repositories.NewResumeRepository(db)
+	guildRepo := repositories.NewGuildRepository(db)
+	guildMemberRepo := repositories.NewGuildMemberRepository(db)
+	permRepo := repositories.NewPermissionOverwriteRepository(db)
+	categoryRepo := repositories.NewCategoryRepository(db)
+	channelRepo := repositories.NewChannelRepository(db)
+	guildRoleRepo := repositories.NewGuildRoleRepository(db)
 
-	// Initialize services.
+	// ─── Services
+	authService := authsvc.NewService(userRepo, jwtSecret, 72*time.Hour)
+	userService := usersvc.NewService(storageService, userRepo)
+	groupService := groupsvc.NewService(groupRepo)
+	friendService := frdsvc.NewService(friendRepo, db)
+	messagingService := msgsrv.NewService(rdb, messagingRepo)
+	resumeService := resumeSvc.NewService(resumeRepo)
+	guildService := guildsvc.NewService(guildRepo, guildMemberRepo)
 	presenceService := realtime.NewPresenceService(rdb)
-	authService := services.NewAuthService(db, string(jwtSecret))
-	userService := services.NewUserService(storageService, db)
-	groupService := services.NewGroupService(groupRepo)
-	messagingService := services.NewMessagingService(rdb, messagingRepo)
+	permService := permissions.NewService(permRepo)
+	categoryService := categories.NewService(categoryRepo, channelRepo)
+	channelService := channels.NewService(channelRepo)
+	guildRoleService := guildroles.NewService(guildRoleRepo)
 
-	// Initialize controllers.
-	presenceController := controllers.NewPresenceController(presenceService, rdb, logger)
+	// ─── Controllers
 	authController := controllers.NewAuthController(authService, logger)
-	userController := controllers.NewUserController(logger, userService, string(jwtSecret))
-	messagingController := controllers.NewMessagingController(messagingService, groupService, logger)
+	userController := controllers.NewUserController(logger, userService)
 	groupController := controllers.NewGroupController(groupService, logger)
+	messagingController := controllers.NewMessagingController(messagingService, groupService, logger)
+	presenceController := controllers.NewPresenceController(presenceService, rdb, logger)
+	resumeController := controllers.NewResumeController(resumeService, logger)
+	friendshipController := controllers.NewFriendshipController(friendService, logger)
+	guildController := controllers.NewGuildController(guildService, logger)
+	permissionsController := controllers.NewPermissionsController(permService, logger)
+	categoryController := controllers.NewCategoriesController(categoryService, logger)
+	channelController := controllers.NewChannelsController(channelService, logger)
+	guildRolesController := controllers.NewGuildRolesController(guildRoleService, logger)
 
+	// ─── Redis‐TTL cleanup & expired listener
+	go func() {
+		ticker := time.NewTicker(1 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			if err := messagingService.TransferExpiredMessages(context.Background()); err != nil {
+				logger.Error("TransferExpiredMessages error:", err)
+			}
+		}
+	}()
 	if err := listeners.RedisExpiredListener(context.Background(), rdb, messagingService); err != nil {
-		log.Printf("Error starting Redis expired listener: %v", err)
+		logger.Errorf("RedisExpiredListener error: %v", err)
 	}
 
-	// Setup Router.
+	// ─── Router & CORS
 	router := SetupRouter(
 		authController,
 		presenceController,
 		userController,
 		messagingController,
 		groupController,
+		resumeController,
+		friendshipController,
+		guildController,
+		permissionsController,
+		categoryController,
+		channelController,
+		guildRolesController,
 	)
-
-	// Configure CORS.
-	corsRouter := handlers.CORS(
-		handlers.AllowedOrigins([]string{"http://localhost:1420"}),
+	cors := handlers.CORS(
+		handlers.AllowedOrigins([]string{utils.GetEnv("CORS_ORIGIN", "http://localhost:1420")}),
 		handlers.AllowedMethods([]string{"GET", "POST", "PUT", "DELETE", "OPTIONS"}),
 		handlers.AllowedHeaders([]string{"Authorization", "Content-Type"}),
 	)(router)
 
-	server := &http.Server{
-		Handler:      corsRouter,
-		Addr:         ":" + getEnv("APP_PORT", "8080"),
-		WriteTimeout: 15 * time.Second,
+	srv := &http.Server{
+		Addr:         ":" + utils.GetEnv("APP_PORT", "8080"),
+		Handler:      cors,
 		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
 	}
-
-	logger.Info("Server initialization completed")
-	go func() {
-		ticker := time.NewTicker(1 * time.Minute)
-		defer ticker.Stop()
-		for range ticker.C {
-			err := messagingService.TransferExpiredMessages(context.Background())
-			if err != nil {
-				logger.Error("Error transferring expired messages: ", err)
-			}
-		}
-	}()
-	logger.Info("Initialized go routine for transferring expired messages")
-	return server, nil
-}
-
-func loadEnv() error {
-	if err := godotenv.Load(); err != nil {
-		return fmt.Errorf("no .env file found, using environment variables")
-	}
-	return nil
+	logger.Info("Server initialized on port ", utils.GetEnv("APP_PORT", "8080"))
+	return srv, nil
 }
 
 func initRedis(logger *logrus.Logger) (*redis.Client, error) {
@@ -144,73 +191,115 @@ func initRedis(logger *logrus.Logger) (*redis.Client, error) {
 	return rdb, nil
 }
 
-func initS3Client() (*minio.Client, error) {
-	rawURL := getEnv("SEAWEEDFS_URL", "http://localhost:8333")
+func bootstrapMinio(
+	ctx context.Context,
+	endpoint string, // e.g. http://minio:9000
+	rootUser string,
+	rootPass string,
+	bucket string, // avatars
+	uploadUser string, // MINIO_UPLOAD_USER
+	uploadPass string, // MINIO_UPLOAD_PASSWORD
+) error {
+	const writeAction = "s3:PutObject"
 
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return fmt.Errorf("parse endpoint: %w", err)
+	}
+
+	// ─── 1. root S3 client (bucket + public policy) ───────────────────────────
+	rootS3, err := minio.New(u.Host, &minio.Options{
+		Creds:  credentials.NewStaticV4(rootUser, rootPass, ""),
+		Secure: u.Scheme == "https",
+	})
+	if err != nil {
+		return fmt.Errorf("root S3 client: %w", err)
+	}
+
+	// bucket
+	if err := rootS3.MakeBucket(ctx, bucket, minio.MakeBucketOptions{}); err != nil {
+		exists, _ := rootS3.BucketExists(ctx, bucket)
+		if !exists {
+			return fmt.Errorf("make bucket: %w", err)
+		}
+	}
+
+	// public‑download policy
+	policy := fmt.Sprintf(`{
+	  "Version":"2012-10-17",
+	  "Statement":[{
+	    "Effect":"Allow",
+	    "Principal":"*",
+	    "Action":["s3:GetObject"],
+	    "Resource":["arn:aws:s3:::%s/*"]
+	  }]
+	}`, bucket)
+	if err := rootS3.SetBucketPolicy(ctx, bucket, policy); err != nil {
+		return fmt.Errorf("set public policy: %w", err)
+	}
+
+	// ─── 2. admin client (user + write policy) ────────────────────────────────
+	admin, err := madmin.New(u.Host, rootUser, rootPass, u.Scheme == "https")
+	if err != nil {
+		return fmt.Errorf("admin client: %w", err)
+	}
+
+	writePolID := "writeonly-" + bucket
+	writePolicy := map[string]any{
+		"Version": "2012-10-17",
+		"Statement": []map[string]any{{
+			"Effect":   "Allow",
+			"Action":   []string{writeAction},
+			"Resource": []string{fmt.Sprintf("arn:aws:s3:::%s/*", bucket)},
+		}},
+	}
+	buf, _ := json.Marshal(writePolicy)
+	_ = admin.AddCannedPolicy(ctx, writePolID, buf)            // ignore AlreadyExists
+	_ = admin.AddUser(ctx, uploadUser, uploadPass)             // ignore AlreadyExists
+	return admin.SetPolicy(ctx, writePolID, uploadUser, false) // idempotent
+}
+
+func initMinioClient() (*minio.Client, error) {
+	rawURL := utils.MustEnv("STORAGE_ENDPOINT") // e.g. http://minio:9000
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return nil, fmt.Errorf("invalid SEAWEEDFS_URL %q: %w", rawURL, err)
+		return nil, fmt.Errorf("invalid STORAGE_ENDPOINT %q: %w", rawURL, err)
 	}
 
-	endpoint := u.Host            // host[:port]
-	secure := u.Scheme == "https" // true ↔ HTTPS
+	// choose upload-only user if provided, else fallback to root
+	accessKey := os.Getenv("MINIO_UPLOAD_USER")
+	secretKey := os.Getenv("MINIO_UPLOAD_PASSWORD")
+	if accessKey == "" || secretKey == "" {
+		accessKey = os.Getenv("MINIO_ROOT_USER")
+		secretKey = os.Getenv("MINIO_ROOT_PASSWORD")
+	}
 
-	accessKey := os.Getenv("S3_ACCESS_KEY")
-	secretKey := os.Getenv("S3_SECRET_KEY")
-
-	const maxRetries = 5
-	var lastErr error
-
-	for i := 1; i <= maxRetries; i++ {
-		clt, err := minio.New(endpoint, &minio.Options{
+	retries := 5
+	var client *minio.Client
+	for i := 0; i < retries; i++ {
+		client, err = minio.New(u.Host, &minio.Options{
 			Creds:  credentials.NewStaticV4(accessKey, secretKey, ""),
-			Secure: secure,
+			Secure: u.Scheme == "https",
 		})
 		if err == nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			if _, err = clt.ListBuckets(ctx); err == nil {
-				return clt, nil // success
-			}
+			break
 		}
-
-		lastErr = err
-		log.Printf("Warning: S3 init failed (%d/%d): %v", i, maxRetries, err)
-		time.Sleep(time.Duration(1<<i) * time.Second) // 2 s, 4 s, 8 s…
+		time.Sleep(2 * time.Second)
 	}
-	return nil, fmt.Errorf("failed to initialise S3 client: %w", lastErr)
+
+	if client == nil || err != nil {
+		return nil, fmt.Errorf(
+			"failed to initialize MinIO client after %d retries: %w",
+			retries, err,
+		)
+	}
+	return client, nil
 }
 
 func initStorageService(client *minio.Client) (*storage.StorageService, error) {
-	bucket := "avatars"
-	var storageService *storage.StorageService
-
-	go func() {
-		for {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-
-			exists, err := client.BucketExists(ctx, bucket)
-			if err != nil {
-				log.Printf("Warning: error checking bucket existence: %v. Retrying...", err)
-			} else if !exists {
-				if err := client.MakeBucket(ctx, bucket, minio.MakeBucketOptions{}); err != nil {
-					log.Printf("Error creating bucket: %v. Retrying...", err)
-				} else {
-					log.Printf("Bucket '%s' created successfully", bucket)
-					break
-				}
-			} else {
-				log.Printf("Bucket '%s' already exists", bucket)
-				break
-			}
-
-			time.Sleep(10 * time.Second) // Retry after 10 seconds
-		}
-	}()
-
-	storageService = storage.NewStorageService(client, bucket)
-	return storageService, nil
+	bucket := utils.GetEnv("STORAGE_BUCKET", "avatars")
+	svc := storage.NewStorageService(client, bucket)
+	return svc, nil
 }
 
 func initDatabaseWithDefaults() (*gorm.DB, error) {
@@ -218,34 +307,63 @@ func initDatabaseWithDefaults() (*gorm.DB, error) {
 	user := utils.MustEnv("DB_USER")
 	pass := utils.MustEnv("DB_PASSWORD")
 	dbName := utils.MustEnv("DB_NAME")
-	sslmode := utils.GetEnv("DB_SSLMODE", "disable") // override later if you add TLS
+	sslmode := utils.GetEnv("DB_SSLMODE", "disable")
 	tz := utils.GetEnv("DB_TIMEZONE", "UTC")
 
 	dsn := fmt.Sprintf(
 		"host=%s user=%s password=%s dbname=%s sslmode=%s TimeZone=%s",
 		host, user, pass, dbName, sslmode, tz,
 	)
-
 	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to database: %w", err)
 	}
 
+	if err := db.Exec(`CREATE EXTENSION IF NOT EXISTS "uuid-ossp";`).Error; err != nil {
+		return nil, fmt.Errorf("failed to create uuid-ossp extension: %w", err)
+	}
+
 	if err := db.AutoMigrate(
+		// core
 		&models.User{},
-		&models.Group{},
-		&models.GroupMembership{},
 		&models.Message{},
+
+		// legacy group feature
+		&groups.Group{},
+		&groups.GroupMembership{},
+
+		// friendship system
+		&friendships.FriendRequest{},
+
+		// Discord‐style guilds
+		&guilds.Guild{},
+		&guilds.GuildRole{},
+		&guilds.GuildMember{},
+		&guilds.Category{},
+		&guilds.Channel{},
+		&guilds.PermissionOverwrite{},
+
+		// resumes
+		&models.Resume{},
+		&resume.Education{},
+		&resume.Experience{},
+		&resume.Project{},
+		&resume.Certification{},
+		&resume.Skill{},
+		&resume.Interest{},
 	); err != nil {
 		return nil, fmt.Errorf("auto-migration failed: %w", err)
 	}
 
 	return db, nil
 }
-
 func getEnv(key, fallback string) string {
 	if value := os.Getenv(key); value != "" {
 		return value
 	}
 	return fallback
+}
+
+func endpointHostOnly(u *url.URL) string {
+	return u.Host
 }

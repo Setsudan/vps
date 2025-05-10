@@ -2,116 +2,113 @@ package controllers
 
 import (
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"strings"
-	"time"
 
 	connectionmanager "launay-dot-one/manager"
 	"launay-dot-one/middlewares"
 	"launay-dot-one/models"
-	"launay-dot-one/services"
+	"launay-dot-one/services/groups"
+	"launay-dot-one/services/messaging"
 	"launay-dot-one/utils"
 
 	"github.com/gin-gonic/gin"
-	"github.com/golang-jwt/jwt/v4"
 	"github.com/gorilla/websocket"
 	"github.com/sirupsen/logrus"
+	"gorm.io/datatypes"
 )
 
-// ----------------------------------------------------------------------------
-// helpers
-// ----------------------------------------------------------------------------
-
-func parseJWT(tokenStr string, secret []byte) (jwt.MapClaims, error) {
-	tok, err := jwt.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {
-		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
-		}
-		return secret, nil
-	})
-	if err != nil || !tok.Valid {
-		return nil, fmt.Errorf("invalid token: %w", err)
-	}
-	claims, ok := tok.Claims.(jwt.MapClaims)
-	if !ok || claims["user_id"] == nil {
-		return nil, fmt.Errorf("missing user_id claim")
-	}
-	return claims, nil
-}
-
-func buildUpgrader() websocket.Upgrader {
-	raw := utils.GetEnv("WS_ALLOWED_ORIGINS", "https://app.launay.one")
-	allowed := strings.Split(raw, ",")
-
-	return websocket.Upgrader{
-		ReadBufferSize:  1024,
-		WriteBufferSize: 1024,
-		CheckOrigin: func(r *http.Request) bool {
-			origin := r.Header.Get("Origin")
-			for _, a := range allowed {
-				if strings.TrimSpace(a) == origin {
-					return true
-				}
-			}
-			return false
-		},
-	}
-}
-
-// ----------------------------------------------------------------------------
-// controller
-// ----------------------------------------------------------------------------
-
 type MessagingController struct {
-	messagingService services.MessagingService
-	groupService     services.GroupService
-	logger           *logrus.Logger
-	secret           []byte
-	upgrader         websocket.Upgrader
+	msgSvc   messaging.Service
+	grpSvc   groups.Service
+	logger   *logrus.Logger
+	secret   []byte
+	upgrader websocket.Upgrader
 }
 
-func NewMessagingController(ms services.MessagingService, gs services.GroupService, l *logrus.Logger) *MessagingController {
+func NewMessagingController(
+	ms messaging.Service,
+	gs groups.Service,
+	l *logrus.Logger,
+) *MessagingController {
 	sec := utils.MustEnv("JWT_SECRET")
 	return &MessagingController{
-		messagingService: ms,
-		groupService:     gs,
-		logger:           l,
-		secret:           []byte(sec),
-		upgrader:         buildUpgrader(),
+		msgSvc:   ms,
+		grpSvc:   gs,
+		logger:   l,
+		secret:   []byte(sec),
+		upgrader: BuildUpgrader(),
 	}
 }
-
 func (mc *MessagingController) RegisterRoutes(r *gin.Engine) {
 	msg := r.Group("/messages")
 	{
 		msg.GET("/history", middlewares.AuthMiddleware(), mc.GetChatHistory)
 		msg.POST("/reaction", middlewares.AuthMiddleware(), mc.HandleAddReaction)
-		msg.GET("/ws", mc.HandleWebSocket) // auth inside
+		msg.GET("/ws", mc.HandleWebSocket) // internal auth
 		msg.GET("/conversations", middlewares.AuthMiddleware(), mc.GetAllUserConversations)
 	}
 }
 
+// GetChatHistory now dispatches to DM vs. channel‐based history.
+func (mc *MessagingController) GetChatHistory(c *gin.Context) {
+	targetID := c.Query("target_id")
+	targetType := c.Query("target_type")
+	if targetID == "" || targetType == "" {
+		utils.RespondError(c, http.StatusBadRequest,
+			"target_id and target_type are required", nil)
+		return
+	}
+	userID := c.GetString("user_id")
+	if userID == "" {
+		utils.RespondError(c, http.StatusUnauthorized,
+			"Unauthorized", "Missing user_id")
+		return
+	}
+
+	var (
+		msgs []models.Message
+		err  error
+	)
+	ctx := c.Request.Context()
+	if targetType == "user" {
+		msgs, err = mc.msgSvc.GetMessagesBetweenUsers(ctx, userID, targetID)
+	} else {
+		// group or channel → treat targetID as channel ID
+		msgs, err = mc.msgSvc.GetChannelHistory(ctx, targetID)
+	}
+	if err != nil {
+		mc.logger.Error("Failed to fetch chat history: ", err)
+		utils.RespondError(c, http.StatusInternalServerError,
+			"Failed to fetch chat history", err.Error())
+		return
+	}
+	utils.RespondSuccess(c, http.StatusOK,
+		"Chat history fetched", gin.H{"messages": msgs})
+}
+
 // ----------------------------------------------------------------------------
-// WebSocket handler
+// HandleWebSocket
 // ----------------------------------------------------------------------------
 
 func (mc *MessagingController) HandleWebSocket(c *gin.Context) {
-	// 1. Extract token from the Authorization header like the usual middleware.
+	// 1) Auth
 	auth := c.GetHeader("Authorization")
 	parts := strings.Split(auth, " ")
 	if len(parts) != 2 || parts[0] != "Bearer" {
-		utils.RespondError(c, http.StatusUnauthorized, "Unauthorized", "Missing Bearer token")
+		utils.RespondError(c, http.StatusUnauthorized,
+			"Unauthorized", "Missing Bearer token")
 		return
 	}
-	claims, err := parseJWT(parts[1], mc.secret)
+	claims, err := ParseJWT(parts[1], mc.secret)
 	if err != nil {
-		utils.RespondError(c, http.StatusUnauthorized, "Unauthorized", err.Error())
+		utils.RespondError(c, http.StatusUnauthorized,
+			"Unauthorized", err.Error())
 		return
 	}
 	senderID := claims["user_id"].(string)
 
-	// 2. Upgrade the connection.
+	// 2) Upgrade
 	conn, err := mc.upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
 		mc.logger.Error("WebSocket upgrade error: ", err)
@@ -120,114 +117,124 @@ func (mc *MessagingController) HandleWebSocket(c *gin.Context) {
 	connectionmanager.ConnManager.Add(senderID, conn)
 	defer connectionmanager.ConnManager.Remove(senderID)
 
-	// 3. Handle messages.
+	// 3) Read & broadcast loop
 	ctx := c.Request.Context()
 	for {
 		_, data, err := conn.ReadMessage()
 		if err != nil {
-			mc.logger.Warn("WebSocket read error: ", err)
+			mc.logger.Warn("WS read error: ", err)
 			break
 		}
-		var msg models.Message
-		if err := json.Unmarshal(data, &msg); err != nil {
-			mc.logger.Warn("Invalid message JSON: ", err)
+
+		// unmarshal only the old payload fields
+		var p struct {
+			TargetID    string          `json:"target_id"`
+			TargetType  string          `json:"target_type"`
+			Content     string          `json:"content"`
+			Attachments json.RawMessage `json:"attachments,omitempty"`
+		}
+		if err := json.Unmarshal(data, &p); err != nil {
+			mc.logger.Warn("Invalid WS JSON: ", err)
 			continue
 		}
-		msg.SenderID = senderID
-		msg.Timestamp = time.Now()
 
-		if err := mc.messagingService.SendMessage(ctx, msg); err != nil {
+		// build new Message (cast attachments)
+		msg := models.Message{
+			ChannelID:   p.TargetID,
+			AuthorID:    senderID,
+			Content:     p.Content,
+			Attachments: datatypes.JSON(p.Attachments),
+		}
+		if err := mc.msgSvc.SendMessage(ctx, &msg); err != nil {
 			_ = conn.WriteJSON(utils.APIResponse{
-				Code: http.StatusInternalServerError, Message: "Failed to send message", Error: err.Error(),
+				Code:    http.StatusInternalServerError,
+				Message: "Failed to send message",
+				Error:   err.Error(),
 			})
 			continue
 		}
 
-		switch msg.TargetType {
+		// dispatch
+		switch p.TargetType {
 		case "user":
-			if rc, ok := connectionmanager.ConnManager.Get(msg.TargetID); ok {
-				_ = rc.WriteJSON(utils.APIResponse{Code: http.StatusOK, Message: "New message", Data: msg})
+			if rc, ok := connectionmanager.ConnManager.Get(p.TargetID); ok {
+				_ = rc.WriteJSON(utils.APIResponse{
+					Code:    http.StatusOK,
+					Message: "New message",
+					Data:    msg,
+				})
 			}
-		case "group", "channel":
-			members, err := mc.groupService.ListMembers(ctx, msg.TargetID)
+
+		case "group":
+			members, err := mc.grpSvc.ListMembers(ctx, p.TargetID)
 			if err != nil {
-				mc.logger.Error("list members: ", err)
+				mc.logger.Error("ListMembers error: ", err)
 			}
 			for _, m := range members {
 				if m.UserID == senderID {
 					continue
 				}
 				if rc, ok := connectionmanager.ConnManager.Get(m.UserID); ok {
-					_ = rc.WriteJSON(utils.APIResponse{Code: http.StatusOK, Message: "New message", Data: msg})
+					_ = rc.WriteJSON(utils.APIResponse{
+						Code:    http.StatusOK,
+						Message: "New message",
+						Data:    msg,
+					})
 				}
 			}
 		}
 
-		_ = conn.WriteJSON(utils.APIResponse{Code: http.StatusOK, Message: "Message sent", Data: msg})
+		// ack back
+		_ = conn.WriteJSON(utils.APIResponse{
+			Code:    http.StatusOK,
+			Message: "Message sent",
+			Data:    msg,
+		})
 	}
 }
 
-func (mc *MessagingController) GetChatHistory(c *gin.Context) {
-	targetID := c.Query("target_id")
-	targetType := c.Query("target_type")
-	if targetID == "" || targetType == "" {
-		utils.RespondError(c, http.StatusBadRequest, "target_id and target_type are required", nil)
-		return
-	}
-
-	userID := c.GetString("user_id")
-	if userID == "" {
-		utils.RespondError(c, http.StatusUnauthorized, "Unauthorized", "Missing user ID")
-		return
-	}
-
-	messages, err := mc.messagingService.GetChatHistory(c.Request.Context(), userID, targetID)
-	if err != nil {
-		mc.logger.Error("Failed to retrieve chat history: ", err)
-		utils.RespondError(c, http.StatusInternalServerError, "Failed to retrieve chat history", err.Error())
-		return
-	}
-
-	utils.RespondSuccess(c, http.StatusOK, "Chat history fetched", map[string]interface{}{"messages": messages})
-}
-
+// HandleAddReaction unchanged
 func (mc *MessagingController) HandleAddReaction(c *gin.Context) {
-	var payload struct {
+	var p struct {
 		MessageID string `json:"message_id"`
 		Reaction  string `json:"reaction"`
 	}
-	if err := c.BindJSON(&payload); err != nil {
-		utils.RespondError(c, http.StatusBadRequest, "Invalid payload", err.Error())
+	if err := c.BindJSON(&p); err != nil {
+		utils.RespondError(c, http.StatusBadRequest,
+			"Invalid payload", err.Error())
 		return
 	}
-
 	userID := c.GetString("user_id")
 	if userID == "" {
-		utils.RespondError(c, http.StatusUnauthorized, "Unauthorized", "Missing user_id")
+		utils.RespondError(c, http.StatusUnauthorized,
+			"Unauthorized", "Missing user_id")
 		return
 	}
-
-	if err := mc.messagingService.AddReaction(c.Request.Context(), payload.MessageID, payload.Reaction, userID); err != nil {
-		mc.logger.Error("Failed to add reaction: ", err)
-		utils.RespondError(c, http.StatusInternalServerError, "Failed to add reaction", err.Error())
+	if err := mc.msgSvc.AddReaction(
+		c.Request.Context(), p.MessageID, p.Reaction, userID,
+	); err != nil {
+		mc.logger.Error("AddReaction error: ", err)
+		utils.RespondError(c, http.StatusInternalServerError,
+			"Failed to add reaction", err.Error())
 		return
 	}
 	utils.RespondSuccess(c, http.StatusOK, "Reaction added", nil)
 }
+
+// GetAllUserConversations proxies to msgSvc.GetUserConversations
 func (mc *MessagingController) GetAllUserConversations(c *gin.Context) {
 	userID := c.GetString("user_id")
 	if userID == "" {
-		utils.RespondError(c, http.StatusUnauthorized, "Unauthorized", "Missing user ID")
+		utils.RespondError(c, http.StatusUnauthorized,
+			"Unauthorized", "Missing user_id")
 		return
 	}
-
-	convos, err := mc.messagingService.GetUserConversations(c.Request.Context(), userID)
+	convos, err := mc.msgSvc.GetUserConversations(c.Request.Context(), userID)
 	if err != nil {
-		utils.RespondError(c, http.StatusInternalServerError, "Failed to fetch conversations", err.Error())
+		utils.RespondError(c, http.StatusInternalServerError,
+			"Failed to fetch conversations", err.Error())
 		return
 	}
-
-	utils.RespondSuccess(c, http.StatusOK, "Conversations retrieved", gin.H{
-		"conversations": convos,
-	})
+	utils.RespondSuccess(c, http.StatusOK,
+		"Conversations retrieved", gin.H{"conversations": convos})
 }
