@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -36,6 +37,7 @@ import (
 	"github.com/go-redis/redis/v8"
 	"github.com/gorilla/handlers"
 	"github.com/joho/godotenv"
+	"github.com/minio/madmin-go"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/sirupsen/logrus"
@@ -59,6 +61,19 @@ func InitServer() (*http.Server, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	if err := bootstrapMinio(
+		context.Background(),
+		utils.MustEnv("STORAGE_ENDPOINT"), // e.g. http://minio:9000
+		utils.MustEnv("MINIO_ROOT_USER"),
+		utils.MustEnv("MINIO_ROOT_PASSWORD"),
+		utils.GetEnv("STORAGE_BUCKET", "avatars"),
+		os.Getenv("MINIO_UPLOAD_USER"),
+		os.Getenv("MINIO_UPLOAD_PASSWORD"),
+	); err != nil {
+		logger.Fatalf("MinIO bootstrap failed: %v", err)
+	}
+
 	storageService, err := initStorageService(minioClient)
 	if err != nil {
 		return nil, err
@@ -176,6 +191,74 @@ func initRedis(logger *logrus.Logger) (*redis.Client, error) {
 	return rdb, nil
 }
 
+func bootstrapMinio(
+	ctx context.Context,
+	endpoint string, // e.g. http://minio:9000
+	rootUser string,
+	rootPass string,
+	bucket string, // avatars
+	uploadUser string, // MINIO_UPLOAD_USER
+	uploadPass string, // MINIO_UPLOAD_PASSWORD
+) error {
+	const writeAction = "s3:PutObject"
+
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return fmt.Errorf("parse endpoint: %w", err)
+	}
+
+	// ─── 1. root S3 client (bucket + public policy) ───────────────────────────
+	rootS3, err := minio.New(u.Host, &minio.Options{
+		Creds:  credentials.NewStaticV4(rootUser, rootPass, ""),
+		Secure: u.Scheme == "https",
+	})
+	if err != nil {
+		return fmt.Errorf("root S3 client: %w", err)
+	}
+
+	// bucket
+	if err := rootS3.MakeBucket(ctx, bucket, minio.MakeBucketOptions{}); err != nil {
+		exists, _ := rootS3.BucketExists(ctx, bucket)
+		if !exists {
+			return fmt.Errorf("make bucket: %w", err)
+		}
+	}
+
+	// public‑download policy
+	policy := fmt.Sprintf(`{
+	  "Version":"2012-10-17",
+	  "Statement":[{
+	    "Effect":"Allow",
+	    "Principal":"*",
+	    "Action":["s3:GetObject"],
+	    "Resource":["arn:aws:s3:::%s/*"]
+	  }]
+	}`, bucket)
+	if err := rootS3.SetBucketPolicy(ctx, bucket, policy); err != nil {
+		return fmt.Errorf("set public policy: %w", err)
+	}
+
+	// ─── 2. admin client (user + write policy) ────────────────────────────────
+	admin, err := madmin.New(u.Host, rootUser, rootPass, u.Scheme == "https")
+	if err != nil {
+		return fmt.Errorf("admin client: %w", err)
+	}
+
+	writePolID := "writeonly-" + bucket
+	writePolicy := map[string]any{
+		"Version": "2012-10-17",
+		"Statement": []map[string]any{{
+			"Effect":   "Allow",
+			"Action":   []string{writeAction},
+			"Resource": []string{fmt.Sprintf("arn:aws:s3:::%s/*", bucket)},
+		}},
+	}
+	buf, _ := json.Marshal(writePolicy)
+	_ = admin.AddCannedPolicy(ctx, writePolID, buf)            // ignore AlreadyExists
+	_ = admin.AddUser(ctx, uploadUser, uploadPass)             // ignore AlreadyExists
+	return admin.SetPolicy(ctx, writePolID, uploadUser, false) // idempotent
+}
+
 func initMinioClient() (*minio.Client, error) {
 	rawURL := utils.MustEnv("STORAGE_ENDPOINT") // e.g. http://minio:9000
 	u, err := url.Parse(rawURL)
@@ -279,4 +362,8 @@ func getEnv(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func endpointHostOnly(u *url.URL) string {
+	return u.Host
 }
