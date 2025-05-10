@@ -157,9 +157,11 @@ func InitServer() (*http.Server, error) {
 		guildRolesController,
 	)
 	cors := handlers.CORS(
-		handlers.AllowedOrigins([]string{utils.GetEnv("CORS_ORIGIN", "http://localhost:1420")}),
+		handlers.AllowedOrigins([]string{utils.GetEnv("CORS_ORIGIN", "http://localhost:4200")}),
 		handlers.AllowedMethods([]string{"GET", "POST", "PUT", "DELETE", "OPTIONS"}),
 		handlers.AllowedHeaders([]string{"Authorization", "Content-Type"}),
+		handlers.AllowCredentials(),
+		handlers.MaxAge(28800), // 8 hours
 	)(router)
 
 	srv := &http.Server{
