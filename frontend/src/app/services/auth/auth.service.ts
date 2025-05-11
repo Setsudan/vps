@@ -1,9 +1,11 @@
 import { Injectable, inject } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import { SessionService } from '../session/session.service';
-import { map, Observable, tap } from 'rxjs';
+import { map, Observable, switchMap, tap } from 'rxjs';
 import { environment } from '../../../environments/environment';
 import { APIResponse, unwrapAPIResponse } from '../../../types/apiResponse';
+import { UserStateService } from '../user-state/user-state.service';
+import { IUser } from '../../../types/user';
 
 interface RegisterPayload {
   username: string;
@@ -11,14 +13,11 @@ interface RegisterPayload {
   password: string;
 }
 
-interface LoginPayload {
-  token: string;
-}
-
 @Injectable({ providedIn: 'root' })
 export class AuthService {
   private readonly http = inject(HttpClient);
   private readonly session = inject(SessionService);
+  private readonly userState = inject(UserStateService);
   private readonly apiUrl = environment.apiUrl;
 
   /**
@@ -35,15 +34,18 @@ export class AuthService {
    */
   login(email: string, password: string): Observable<void> {
     return this.http
-      .post<APIResponse<LoginPayload>>(`${this.apiUrl}/auth/login`, {
+      .post<APIResponse<{ token: string }>>(`${this.apiUrl}/auth/login`, {
         email,
         password,
       })
       .pipe(
         map(unwrapAPIResponse),
-        tap((data) => {
-          this.session.setToken(data.token);
-        }),
+        tap((data) => this.session.setToken(data.token)),
+        switchMap(() =>
+          this.http.get<APIResponse<IUser>>(`${this.apiUrl}/user/me`)
+        ),
+        map(unwrapAPIResponse),
+        tap((user) => this.userState.set(user)),
         map(() => void 0)
       );
   }
@@ -53,6 +55,7 @@ export class AuthService {
    */
   logout(): void {
     this.session.clearSession();
+    this.userState.clear();
   }
 
   /**

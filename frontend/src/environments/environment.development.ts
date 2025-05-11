@@ -4,4 +4,5 @@ export const environment = {
   tokenIv:
     'C8rQy1aebTx5kGknvhe45Do0mFOnoJl27WEPybxcrzgZB6af13XvxEvWCV5bUjSYFPXJQJ9eFOLZ98YqyhbRmzTW9UKh3eE6vTi24CKeGmTQ5eda9lIKsGofFpYckEgWv1F9u7mBGu1Fr1M3ul3ol5m0nDCMC4kusWlBDUjxU7BAmSZeBUVBfQa0jMGmirJtmjPHGNcZuw3RRmtCsNHYNxhI7pooMD3N9ofjuWqyD4rpcpnIpki3qJJ8O5T5lwjUwZ8leF5M73iDH1AAXtJKmVRUAJ9Ukpm4QsOMtwGnVUd93gcwRhXq2eUKx9A9np35',
   apiUrl: 'http://localhost/api',
+  userCacheTTL: 3600,
 };
