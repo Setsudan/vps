@@ -115,7 +115,7 @@ func InitServer() (*http.Server, error) {
 
 	// ─── Controllers
 	authController := controllers.NewAuthController(authService, logger)
-	userController := controllers.NewUserController(logger, userService)
+	userController := controllers.NewUserController(logger, userService, guildService)
 	groupController := controllers.NewGroupController(groupService, logger)
 	messagingController := controllers.NewMessagingController(messagingService, groupService, logger)
 	presenceController := controllers.NewPresenceController(presenceService, rdb, logger)

@@ -26,6 +26,7 @@ func (gc *GuildController) RegisterRoutes(r *gin.Engine) {
 	{
 		grp.POST("", gc.CreateGuild)
 		grp.GET("", gc.ListGuilds)
+		grp.GET("/me", gc.ListUserGuilds)
 		grp.GET("/:guild_id", gc.GetGuild)
 		grp.PUT("/:guild_id", gc.UpdateGuild)
 		grp.DELETE("/:guild_id", gc.DeleteGuild)
@@ -179,4 +180,15 @@ func (gc *GuildController) ListMembers(c *gin.Context) {
 		return
 	}
 	utils.RespondSuccess(c, http.StatusOK, "Members fetched", list)
+}
+
+func (gc *GuildController) ListUserGuilds(c *gin.Context) {
+	userID := c.GetString("user_id")
+	list, err := gc.svc.ListGuildsForUser(c.Request.Context(), userID)
+	if err != nil {
+		gc.logger.Error("ListUserGuilds error: ", err)
+		utils.RespondError(c, http.StatusInternalServerError, "Failed to list your guilds", err.Error())
+		return
+	}
+	utils.RespondSuccess(c, http.StatusOK, "Guilds fetched", list)
 }

@@ -115,3 +115,7 @@ func (s *service) RemoveMember(ctx context.Context, guildID, userID, requesterID
 func (s *service) ListMembers(ctx context.Context, guildID string) ([]guilds.GuildMember, error) {
 	return s.memberRepo.ListByGuild(ctx, guildID)
 }
+
+func (s *service) ListGuildsForUser(ctx context.Context, userID string) ([]guilds.Guild, error) {
+	return s.guildRepo.ListByUser(ctx, userID)
+}

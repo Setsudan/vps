@@ -20,4 +20,5 @@ type Service interface {
 	UpdateMemberRoles(ctx context.Context, guildID, userID string, roleIDs []string, requesterID string) error
 	RemoveMember(ctx context.Context, guildID, userID, requesterID string) error
 	ListMembers(ctx context.Context, guildID string) ([]mg.GuildMember, error)
+	ListGuildsForUser(ctx context.Context, userID string) ([]mg.Guild, error)
 }

@@ -7,23 +7,30 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"launay-dot-one/middlewares"
+	m "launay-dot-one/models"
+	"launay-dot-one/models/guilds"
+	guildsvc "launay-dot-one/services/guilds"
 	usersvc "launay-dot-one/services/users"
 	"launay-dot-one/utils"
 )
 
 type UserController struct {
-	userSvc usersvc.Service
-	logger  *logrus.Logger
+	userSvc  usersvc.Service
+	guildSvc guildsvc.Service
+	logger   *logrus.Logger
 }
 
 func NewUserController(
 	logger *logrus.Logger,
 	userSvc usersvc.Service,
+	guildSvc guildsvc.Service,
 ) *UserController {
-	return &UserController{
-		userSvc: userSvc,
-		logger:  logger,
-	}
+	return &UserController{userSvc: userSvc, guildSvc: guildSvc, logger: logger}
+}
+
+type CurrentUserWithGuilds struct {
+	m.PublicUser
+	Guilds []guilds.Guild `json:"guilds"`
 }
 
 func (uc *UserController) RegisterRoutes(r *gin.Engine) {
@@ -91,13 +98,28 @@ func (uc *UserController) GetUserByID(c *gin.Context) {
 // GetCurrent returns the profile of the authenticated user.
 func (uc *UserController) GetCurrent(c *gin.Context) {
 	userID := c.GetString("user_id")
+
+	// 1. Fetch the user profile
 	pu, err := uc.userSvc.GetCurrent(c.Request.Context(), userID)
 	if err != nil {
 		uc.logger.Error("GetCurrent error: ", err)
 		utils.RespondError(c, http.StatusInternalServerError, "Failed to fetch user", err.Error())
 		return
 	}
-	utils.RespondSuccess(c, http.StatusOK, "User fetched", pu)
+
+	// 2. Fetch only the guilds this user belongs to
+	userGuilds, err := uc.guildSvc.ListGuildsForUser(c.Request.Context(), userID)
+	if err != nil {
+		uc.logger.Error("ListGuildsForUser error: ", err)
+		userGuilds = []guilds.Guild{}
+	}
+
+	// 3. Combine and return
+	resp := CurrentUserWithGuilds{
+		PublicUser: *pu,
+		Guilds:     userGuilds,
+	}
+	utils.RespondSuccess(c, http.StatusOK, "User fetched", resp)
 }
 
 // UpdateProfile applies partial updates to the authenticated user's profile.
